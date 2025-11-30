@@ -1,14 +1,9 @@
-import numpy as np
-import random
-import scipy.io
-from sklearn.model_selection import train_test_split
-from sklearn.utils import shuffle
-from sklearn.preprocessing import LabelBinarizer
-import os
-import matplotlib.image as mpimg
-
+# =============================================================================
+# DATA LOADER - Exact copy from original seqnn_dataLoader.py
+# =============================================================================
 
 def get_sat_data(path):
+    """Load SAT-6 satellite imagery dataset."""
     data = scipy.io.loadmat(path)
 
     train_x = data['train_x']
@@ -25,10 +20,11 @@ def get_sat_data(path):
         for i in range(train_y.shape[1]):
             out_y[i,:] = train_y[:,i]
         return out_x, out_y
+    
     def relabel(train_y, annotations):
         labels = {}
         for annotation in annotations:
-            labels[annotation[0][0]]=annotation[1][0]
+            labels[annotation[0][0]] = annotation[1][0]
         output = []
         for i in range(train_y.shape[0]):
             temp = ''.join([str(int(x)) for x in train_y[i]])
@@ -36,7 +32,7 @@ def get_sat_data(path):
         return np.array(output)
         
     def samples(train_x, train_y, n, labels):
-        out_x, out_y = [],[]
+        out_x, out_y = [], []
         for label in labels:
             temp_x, temp_y = [], []
             for i in range(train_y.shape[0]):
@@ -50,11 +46,11 @@ def get_sat_data(path):
 
     def normalize(img):
         img = img.astype('float64')
-        return (img - np.min(img))/(np.max(img)-np.min(img))
+        return (img - np.min(img)) / (np.max(img) - np.min(img))
 
     def iqr(image):
         for i in range(image.shape[2]):
-            boundry1, boundry2 = np.percentile(image[:,:,i], [2 ,98])
+            boundry1, boundry2 = np.percentile(image[:,:,i], [2, 98])
             image[:,:,i] = np.clip(image[:,:,i], boundry1, boundry2)
         return image
     
@@ -85,6 +81,7 @@ def get_sat_data(path):
 
 
 def get_lcz_data(path):
+    """Load LCZ (Local Climate Zone) dataset."""
     rawdata = scipy.io.loadmat(path)
     data = rawdata['setting0']
     train_x = data['train_x'][0][0]
@@ -95,13 +92,13 @@ def get_lcz_data(path):
 
     def iqr(image):
         for i in range(image.shape[2]):
-            boundry1, boundry2 = np.percentile(image[:,:,i], [2 ,98])
+            boundry1, boundry2 = np.percentile(image[:,:,i], [2, 98])
             image[:,:,i] = np.clip(image[:,:,i], boundry1, boundry2)
         return image
 
     def normalize(img):
         img = img.astype('float64')
-        return (img - np.min(img))/(np.max(img)-np.min(img))
+        return (img - np.min(img)) / (np.max(img) - np.min(img))
     
     def data_process(imgs, labels):
         labels = np.array([str(label).strip() for label in labels])
@@ -120,10 +117,12 @@ def get_lcz_data(path):
 
 
 def get_overhead_data(path):
+    """Load overhead/aerial imagery dataset."""
     def normalize(img):
         return (img - np.min(img)) / (np.max(img) - np.min(img))
+    
     def iqr(image):
-        boundry1, boundry2 = np.percentile(image, [2 ,98])
+        boundry1, boundry2 = np.percentile(image, [2, 98])
         image = np.clip(image, boundry1, boundry2)
         return image
     
@@ -142,6 +141,7 @@ def get_overhead_data(path):
     training_path = os.path.join(path, 'training')
     test_path = os.path.join(path, 'testing')
     labels = ['car', 'ship', 'plane', 'harbor', 'parking_lot']
+    
     for label in labels:
         temp_training_path = os.path.join(training_path, label, '')
         temp_test_path = os.path.join(test_path, label, '')
@@ -156,22 +156,64 @@ def get_overhead_data(path):
     train_x, valid_x, train_y, valid_y = train_test_split(train_x, train_y, test_size=0.15, random_state=33)
     test_x, test_y = shuffle(np.array(test_x), np.array(test_y), random_state=33)
     return train_x, train_y, valid_x, valid_y, test_x, test_y
-    
 
-class DataLoader():
+
+def get_cifar10_data(root_path):
+    """Load CIFAR-10 dataset from pickle files."""
+    def load_batch(f_path):
+        with open(f_path, 'rb') as f:
+            datadict = pickle.load(f, encoding='latin1')
+            X = datadict['data']
+            Y = datadict['labels']
+            # Reshape to (N, 32, 32, 3) - NHWC format
+            X = X.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
+            Y = np.array(Y)
+            return X, Y
+
+    # Load Training Batches (1-5)
+    x_train_list = []
+    y_train_list = []
+    for i in range(1, 6):
+        f = os.path.join(root_path, 'data_batch_%d' % i)
+        X, Y = load_batch(f)
+        x_train_list.append(X)
+        y_train_list.append(Y)
+    
+    train_x = np.concatenate(x_train_list)
+    train_y = np.concatenate(y_train_list)
+    
+    # Load Test Batch
+    test_x, test_y = load_batch(os.path.join(root_path, 'test_batch'))
+    
+    # Normalize
+    train_x = train_x.astype('float32') / 255.0
+    test_x = test_x.astype('float32') / 255.0
+    
+    # Validation split
+    valid_x = train_x[-5000:]
+    valid_y = train_y[-5000:]
+    train_x = train_x[:-5000]
+    train_y = train_y[:-5000]
+
+    return train_x, train_y, valid_x, valid_y, test_x, test_y
+
+
+class DataLoader:
+    """DataLoader class matching original implementation."""
+    
     def __init__(self, dataset):
         self.dataset = dataset
         
         if dataset == 'sat':
             train_x, train_y, valid_x, valid_y, test_x, test_y = get_sat_data('Data/SAT-6/sat-6-full.mat')
-        if dataset == 'lcz':
+        elif dataset == 'lcz':
             train_x, train_y, valid_x, valid_y, test_x, test_y = get_lcz_data('Data/LCZ/data_5fold_5classes.mat')
-        if dataset == 'overhead':
+        elif dataset == 'overhead':
             train_x, train_y, valid_x, valid_y, test_x, test_y = get_overhead_data('Data/overhead')
-        if dataset == 'cifar10':
-            # Point this to the folder shown in your image
-            path = 'Data/cifar-10-batches-py' 
-            train_x, train_y, valid_x, valid_y, test_x, test_y = get_cifar10_data(path)
+        elif dataset == 'cifar10':
+            train_x, train_y, valid_x, valid_y, test_x, test_y = get_cifar10_data('Data/cifar-10-batches-py')
+        else:
+            raise ValueError(f"Unknown dataset: {dataset}")
 
         self.train_x = train_x
         self.train_y = train_y
@@ -188,53 +230,7 @@ class DataLoader():
         train_y = LabelBinarizer().fit_transform(self.train_y)
         valid_y = LabelBinarizer().fit_transform(self.valid_y)
         test_y = LabelBinarizer().fit_transform(self.test_y)
-        return self.train_x, train_y, self.valid_x, valid_y, self.test_x, test_y
-    
-
-import pickle
-import os
-import numpy as np
-
-def get_cifar10_data(root_path):
-    # Helper to load a single pickle file
-    def load_batch(f_path):
-        with open(f_path, 'rb') as f:
-            # CIFAR-10 python version uses latin1 encoding
-            datadict = pickle.load(f, encoding='latin1')
-            X = datadict['data']
-            Y = datadict['labels']
-            
-            # CRITICAL STEP FOR SEQNN:
-            # 1. Reshape to (Count, 3_Channels, 32_Height, 32_Width)
-            # 2. Transpose to (Count, 32_Height, 32_Width, 3_Channels)
-            X = X.reshape(10000, 3, 32, 32).transpose(0, 2, 3, 1)
-            Y = np.array(Y)
-            return X, Y
-
-    # Load Training Batches (1-5)
-    x_train_list = []
-    y_train_list = []
-    for i in range(1, 6):
-        f = os.path.join(root_path, 'data_batch_%d' % i)
-        X, Y = load_batch(f)
-        x_train_list.append(X)
-        y_train_list.append(Y)
-    
-    # Combine training batches
-    train_x = np.concatenate(x_train_list)
-    train_y = np.concatenate(y_train_list)
-    
-    # Load Test Batch
-    test_x, test_y = load_batch(os.path.join(root_path, 'test_batch'))
-    
-    # Preprocessing (Normalization)
-    train_x = train_x.astype('float32') / 255.0
-    test_x = test_x.astype('float32') / 255.0
-    
-    # Create a Validation split (e.g., take last 5000 from train)
-    valid_x = train_x[-5000:]
-    valid_y = train_y[-5000:]
-    train_x = train_x[:-5000]
-    train_y = train_y[:-5000]
-
-    return train_x, train_y, valid_x, valid_y, test_x, test_y
+        return self.train_x.astype(np.float32), train_y.astype(np.float32), \
+               self.valid_x.astype(np.float32), valid_y.astype(np.float32), \
+               self.test_x.astype(np.float32), test_y.astype(np.float32)
+               
