@@ -7,5 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Addded
+- `.gitignore` file.
+- Version 3 of the SEQNN notebook.
+
 ### Changed
 - Updated the `load_batch` function in `get_cifar10_data` function in `seqnn_dataLoader.py` file.

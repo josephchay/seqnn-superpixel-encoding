@@ -1,0 +1,6 @@
+1. Experiments
+    - "Superpixel" (irregular pixel groupings of simmilar colors) technique in Computer Vision.
+        - Challenges:
+            - The paper utilizes a kernel sliding over the cartesian grid locations [(0, 0), (0, 1), (1, 0)], where each have a distinct neighbour,
+                implementation of such would need to have the adaptation of NN in such that there will be comprehension of blob position (can try adapted QGCNN)
+                
