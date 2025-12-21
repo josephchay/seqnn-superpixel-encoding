@@ -1,3 +1,17 @@
+"""
+SEQNN Data Loader (PyTorch Compatible)
+======================================
+Data loading utilities for the SEQNN model.
+
+Supports:
+- SAT-6 dataset
+- So2Sat LCZ42 dataset  
+- Overhead-MNIST dataset
+- CIFAR-10 dataset
+
+Original implementation from: https://github.com/zhu-xlab/SEQNN
+"""
+
 import numpy as np
 import scipy.io
 import os
@@ -7,11 +21,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
 from sklearn.preprocessing import LabelBinarizer
 
+
 # =============================================================================
 # DATA LOADER FUNCTIONS
 # =============================================================================
 
 def get_sat_data(path):
+    """Load and preprocess SAT-6 dataset."""
     data = scipy.io.loadmat(path)
     train_x = data['train_x']
     train_y = data['train_y']
@@ -53,7 +69,7 @@ def get_sat_data(path):
 
     def normalize(img):
         img = img.astype('float64')
-        return (img - np.min(img)) / (np.max(img) - np.min(img))
+        return (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-8)
 
     def iqr(image):
         for i in range(image.shape[2]):
@@ -90,6 +106,7 @@ def get_sat_data(path):
 
 
 def get_lcz_data(path):
+    """Load and preprocess So2Sat LCZ42 dataset."""
     rawdata = scipy.io.loadmat(path)
     data = rawdata['setting0']
     train_x = data['train_x'][0][0]
@@ -106,7 +123,7 @@ def get_lcz_data(path):
 
     def normalize(img):
         img = img.astype('float64')
-        return (img - np.min(img)) / (np.max(img) - np.min(img))
+        return (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-8)
     
     def data_process(imgs, labels):
         labels = np.array([str(label).strip() for label in labels])
@@ -125,8 +142,9 @@ def get_lcz_data(path):
 
 
 def get_overhead_data(path):
+    """Load and preprocess Overhead-MNIST dataset."""
     def normalize(img):
-        return (img - np.min(img)) / (np.max(img) - np.min(img))
+        return (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-8)
     
     def iqr(image):
         boundry1, boundry2 = np.percentile(image, [2, 98])
@@ -219,16 +237,60 @@ def get_cifar10_data(root_path):
 
 
 # =============================================================================
+# SYNTHETIC DATA GENERATOR (for testing without real datasets)
+# =============================================================================
+
+def get_synthetic_data(n_classes=6, n_channels=4, n_train=1000, n_valid=200, n_test=200):
+    """
+    Generate synthetic data for testing the model without real datasets.
+    
+    Args:
+        n_classes: Number of classes
+        n_channels: Number of image channels
+        n_train: Number of training samples
+        n_valid: Number of validation samples
+        n_test: Number of test samples
+        
+    Returns:
+        Tuple of (train_x, train_y, valid_x, valid_y, test_x, test_y)
+    """
+    np.random.seed(42)
+    
+    def generate_samples(n_samples):
+        # Generate random images (32x32 with n_channels)
+        x = np.random.rand(n_samples, 32, 32, n_channels).astype(np.float32)
+        # Generate random labels
+        y = np.random.randint(0, n_classes, n_samples)
+        y_str = np.array([str(label) for label in y])
+        return x, y_str
+    
+    train_x, train_y = generate_samples(n_train)
+    valid_x, valid_y = generate_samples(n_valid)
+    test_x, test_y = generate_samples(n_test)
+    
+    return train_x, train_y, valid_x, valid_y, test_x, test_y
+
+
+# =============================================================================
 # MAIN CLASS
 # =============================================================================
 
 class DataLoader:
-    """DataLoader class matching original implementation."""
+    """
+    DataLoader class matching original implementation.
     
-    def __init__(self, dataset):
+    Supports multiple Earth Observation datasets:
+    - 'sat': SAT-6 dataset (28x28 -> 32x32, 4 channels, 6 classes)
+    - 'lcz': So2Sat LCZ42 dataset (32x32, 4 channels, 5 classes)
+    - 'overhead': Overhead-MNIST dataset (28x28 -> 32x32, 1 channel, 5 classes)
+    - 'cifar10': CIFAR-10 dataset (32x32, 3 channels, 10 classes)
+    - 'synthetic': Synthetic data for testing
+    """
+    
+    def __init__(self, dataset: str):
         self.dataset = dataset
         
-        # Initialize variables to avoid UnboundLocalError if dataset doesn't match
+        # Initialize variables
         train_x, train_y = None, None
         valid_x, valid_y = None, None
         test_x, test_y = None, None
@@ -242,8 +304,11 @@ class DataLoader:
         elif dataset == 'cifar10':
             path = 'Data/cifar-10-batches-py'
             train_x, train_y, valid_x, valid_y, test_x, test_y = get_cifar10_data(path)
+        elif dataset == 'synthetic':
+            train_x, train_y, valid_x, valid_y, test_x, test_y = get_synthetic_data()
         else:
-            raise ValueError(f"Unknown dataset: {dataset}")
+            raise ValueError(f"Unknown dataset: {dataset}. "
+                           f"Supported: 'sat', 'lcz', 'overhead', 'cifar10', 'synthetic'")
 
         self.train_x = train_x
         self.train_y = train_y
@@ -253,14 +318,58 @@ class DataLoader:
         self.test_y = test_y   
         
     def get_categories(self):
-        # Handle cases where labels are not strings (like CIFAR-10 numeric labels)
+        """Get unique class names."""
         class_name = [str(x).strip() for x in np.unique(self.train_y)]
         return class_name
     
     def get_data(self): 
+        """Get data with one-hot encoded labels."""
         # One-hot encode labels
-        train_y = LabelBinarizer().fit_transform(self.train_y)
-        valid_y = LabelBinarizer().fit_transform(self.valid_y)
-        test_y = LabelBinarizer().fit_transform(self.test_y)
-        return self.train_x, train_y, self.valid_x, valid_y, self.test_x, test_y
+        lb = LabelBinarizer()
+        lb.fit(np.concatenate([self.train_y, self.valid_y, self.test_y]))
         
+        train_y = lb.transform(self.train_y)
+        valid_y = lb.transform(self.valid_y)
+        test_y = lb.transform(self.test_y)
+        
+        # Handle binary classification case
+        if train_y.shape[1] == 1:
+            train_y = np.hstack([1 - train_y, train_y])
+            valid_y = np.hstack([1 - valid_y, valid_y])
+            test_y = np.hstack([1 - test_y, test_y])
+        
+        return self.train_x, train_y, self.valid_x, valid_y, self.test_x, test_y
+    
+    def get_info(self):
+        """Get dataset information."""
+        return {
+            'dataset': self.dataset,
+            'n_train': len(self.train_x),
+            'n_valid': len(self.valid_x),
+            'n_test': len(self.test_x),
+            'input_shape': self.train_x.shape[1:],
+            'n_classes': len(self.get_categories()),
+            'classes': self.get_categories()
+        }
+
+
+# =============================================================================
+# TEST
+# =============================================================================
+
+if __name__ == "__main__":
+    # Test with synthetic data
+    print("Testing DataLoader with synthetic data...")
+    loader = DataLoader('synthetic')
+    train_x, train_y, valid_x, valid_y, test_x, test_y = loader.get_data()
+    
+    print(f"\nDataset info:")
+    for key, value in loader.get_info().items():
+        print(f"  {key}: {value}")
+    
+    print(f"\nData shapes:")
+    print(f"  train_x: {train_x.shape}, train_y: {train_y.shape}")
+    print(f"  valid_x: {valid_x.shape}, valid_y: {valid_y.shape}")
+    print(f"  test_x: {test_x.shape}, test_y: {test_y.shape}")
+    
+    print("\nDataLoader test passed!")
