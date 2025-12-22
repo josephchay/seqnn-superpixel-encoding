@@ -1,18 +1,16 @@
 import numpy as np
+import random
 import scipy.io
-import os
-import pickle
-import matplotlib.image as mpimg
 from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
 from sklearn.preprocessing import LabelBinarizer
+import os
+import matplotlib.image as mpimg
 
-# =============================================================================
-# DATA LOADER FUNCTIONS
-# =============================================================================
 
 def get_sat_data(path):
     data = scipy.io.loadmat(path)
+
     train_x = data['train_x']
     train_y = data['train_y']
     test_x = data['test_x']
@@ -27,11 +25,10 @@ def get_sat_data(path):
         for i in range(train_y.shape[1]):
             out_y[i,:] = train_y[:,i]
         return out_x, out_y
-    
     def relabel(train_y, annotations):
         labels = {}
         for annotation in annotations:
-            labels[annotation[0][0]] = annotation[1][0]
+            labels[annotation[0][0]]=annotation[1][0]
         output = []
         for i in range(train_y.shape[0]):
             temp = ''.join([str(int(x)) for x in train_y[i]])
@@ -39,7 +36,7 @@ def get_sat_data(path):
         return np.array(output)
         
     def samples(train_x, train_y, n, labels):
-        out_x, out_y = [], []
+        out_x, out_y = [],[]
         for label in labels:
             temp_x, temp_y = [], []
             for i in range(train_y.shape[0]):
@@ -53,11 +50,11 @@ def get_sat_data(path):
 
     def normalize(img):
         img = img.astype('float64')
-        return (img - np.min(img)) / (np.max(img) - np.min(img))
+        return (img - np.min(img))/(np.max(img)-np.min(img))
 
     def iqr(image):
         for i in range(image.shape[2]):
-            boundry1, boundry2 = np.percentile(image[:,:,i], [2, 98])
+            boundry1, boundry2 = np.percentile(image[:,:,i], [2 ,98])
             image[:,:,i] = np.clip(image[:,:,i], boundry1, boundry2)
         return image
     
@@ -68,9 +65,7 @@ def get_sat_data(path):
             img = imgs[i]
             img = normalize(img)
             img = iqr(img)
-            # Pad to 32x32 if needed (SAT-6 is 28x28)
-            if img.shape[0] < 32:
-                img = np.stack([np.pad(img[:, :, c], [(2, 2), (2, 2)], mode='constant') for c in range(4)], axis=2)
+            img = np.stack([np.pad(img[:, :, c], [(2, 2), (2, 2)], mode='constant') for c in range(4)], axis=2)
             processed_img.append(img)
         return np.array(processed_img), labels    
     
@@ -100,13 +95,13 @@ def get_lcz_data(path):
 
     def iqr(image):
         for i in range(image.shape[2]):
-            boundry1, boundry2 = np.percentile(image[:,:,i], [2, 98])
+            boundry1, boundry2 = np.percentile(image[:,:,i], [2 ,98])
             image[:,:,i] = np.clip(image[:,:,i], boundry1, boundry2)
         return image
 
     def normalize(img):
         img = img.astype('float64')
-        return (img - np.min(img)) / (np.max(img) - np.min(img))
+        return (img - np.min(img))/(np.max(img)-np.min(img))
     
     def data_process(imgs, labels):
         labels = np.array([str(label).strip() for label in labels])
@@ -127,22 +122,18 @@ def get_lcz_data(path):
 def get_overhead_data(path):
     def normalize(img):
         return (img - np.min(img)) / (np.max(img) - np.min(img))
-    
     def iqr(image):
-        boundry1, boundry2 = np.percentile(image, [2, 98])
+        boundry1, boundry2 = np.percentile(image, [2 ,98])
         image = np.clip(image, boundry1, boundry2)
         return image
     
     def load_images(folder, label):
         images = []
-        if not os.path.exists(folder):
-            return [], []
         for filename in os.listdir(folder):
             img = mpimg.imread(os.path.join(folder, filename))
             img = normalize(img)
             img = iqr(img)
-            if img.shape[0] < 32:
-                img = np.pad(img, [(2, 2), (2, 2)], mode='constant')
+            img = np.pad(img, [(2, 2), (2, 2)], mode='constant')
             img = img.reshape(32, 32, 1)
             images.append(img)
         return images, [label] * len(images)
@@ -151,15 +142,12 @@ def get_overhead_data(path):
     training_path = os.path.join(path, 'training')
     test_path = os.path.join(path, 'testing')
     labels = ['car', 'ship', 'plane', 'harbor', 'parking_lot']
-    
     for label in labels:
         temp_training_path = os.path.join(training_path, label, '')
         temp_test_path = os.path.join(test_path, label, '')
-        
         temp_x, temp_y = load_images(temp_training_path, label)
         train_x = train_x + temp_x
         train_y = train_y + temp_y
-        
         temp_x, temp_y = load_images(temp_test_path, label)
         test_x = test_x + temp_x
         test_y = test_y + temp_y
@@ -168,82 +156,18 @@ def get_overhead_data(path):
     train_x, valid_x, train_y, valid_y = train_test_split(train_x, train_y, test_size=0.15, random_state=33)
     test_x, test_y = shuffle(np.array(test_x), np.array(test_y), random_state=33)
     return train_x, train_y, valid_x, valid_y, test_x, test_y
-
-
-def get_cifar10_data(root_path):
-    """Load CIFAR-10 dataset from pickle files."""
-    def load_batch(f_path):
-        with open(f_path, 'rb') as f:
-            datadict = pickle.load(f, encoding='latin1')
-            X = datadict['data']
-            Y = datadict['labels']
-            # Reshape to (N, 3, 32, 32) then transpose to (N, 32, 32, 3) for NHWC
-            X = X.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
-            Y = np.array(Y)
-            return X, Y
-
-    # Load Training Batches (1-5)
-    x_train_list = []
-    y_train_list = []
-    for i in range(1, 6):
-        f = os.path.join(root_path, 'data_batch_%d' % i)
-        if os.path.exists(f):
-            X, Y = load_batch(f)
-            x_train_list.append(X)
-            y_train_list.append(Y)
     
-    if not x_train_list:
-        raise FileNotFoundError(f"No CIFAR-10 data batches found in {root_path}")
 
-    train_x = np.concatenate(x_train_list)
-    train_y = np.concatenate(y_train_list)
-    
-    # Load Test Batch
-    test_path = os.path.join(root_path, 'test_batch')
-    if os.path.exists(test_path):
-        test_x, test_y = load_batch(test_path)
-    else:
-        test_x, test_y = np.array([]), np.array([])
-    
-    # Normalize
-    train_x = train_x.astype('float32') / 255.0
-    test_x = test_x.astype('float32') / 255.0
-    
-    # Validation split
-    valid_x = train_x[-5000:]
-    valid_y = train_y[-5000:]
-    train_x = train_x[:-5000]
-    train_y = train_y[:-5000]
-
-    return train_x, train_y, valid_x, valid_y, test_x, test_y
-
-
-# =============================================================================
-# MAIN CLASS
-# =============================================================================
-
-class DataLoader:
-    """DataLoader class matching original implementation."""
-    
+class DataLoader():
     def __init__(self, dataset):
         self.dataset = dataset
         
-        # Initialize variables to avoid UnboundLocalError if dataset doesn't match
-        train_x, train_y = None, None
-        valid_x, valid_y = None, None
-        test_x, test_y = None, None
-
         if dataset == 'sat':
             train_x, train_y, valid_x, valid_y, test_x, test_y = get_sat_data('Data/SAT-6/sat-6-full.mat')
-        elif dataset == 'lcz':
+        if dataset == 'lcz':
             train_x, train_y, valid_x, valid_y, test_x, test_y = get_lcz_data('Data/LCZ/data_5fold_5classes.mat')
-        elif dataset == 'overhead':
+        if dataset == 'overhead':
             train_x, train_y, valid_x, valid_y, test_x, test_y = get_overhead_data('Data/overhead')
-        elif dataset == 'cifar10':
-            path = 'Data/cifar-10-batches-py'
-            train_x, train_y, valid_x, valid_y, test_x, test_y = get_cifar10_data(path)
-        else:
-            raise ValueError(f"Unknown dataset: {dataset}")
 
         self.train_x = train_x
         self.train_y = train_y
@@ -253,14 +177,15 @@ class DataLoader:
         self.test_y = test_y   
         
     def get_categories(self):
-        # Handle cases where labels are not strings (like CIFAR-10 numeric labels)
         class_name = [str(x).strip() for x in np.unique(self.train_y)]
         return class_name
     
     def get_data(self): 
-        # One-hot encode labels
         train_y = LabelBinarizer().fit_transform(self.train_y)
         valid_y = LabelBinarizer().fit_transform(self.valid_y)
         test_y = LabelBinarizer().fit_transform(self.test_y)
         return self.train_x, train_y, self.valid_x, valid_y, self.test_x, test_y
-        
+    
+
+
+    

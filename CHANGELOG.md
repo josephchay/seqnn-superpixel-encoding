@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Addded
 - `.gitignore` file.
-- Version 3 of the SEQNN notebook.
+- Version 2 of the SEQNN notebook, but results from the training has low accuracy for CIFAR-10 dataset.
 
 ### Changed
 - Updated the `load_batch` function in `get_cifar10_data` function in `seqnn_dataLoader.py` file.
