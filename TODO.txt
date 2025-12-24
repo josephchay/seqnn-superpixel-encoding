@@ -3,4 +3,7 @@
         - Challenges:
             - The paper utilizes a kernel sliding over the cartesian grid locations [(0, 0), (0, 1), (1, 0)], where each have a distinct neighbour,
                 implementation of such would need to have the adaptation of NN in such that there will be comprehension of blob position (can try adapted QGCNN)
-                
+2. Literature Review on Feature extraction and Measurement Strategies and Methods
+3. Continue coding on your code for the framework
+    - Work on the CIFAR-10 dataset
+    - Get the other datasets before this and experiment on them.

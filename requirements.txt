@@ -1,11 +1,22 @@
-tensorflow==2.4.1
-tensorflow-quantum==0.5.0
-sympy==1.5
-scipy==1.8.0
-cirq==0.11.0
-cirq-core==0.11.0
-cirq-google==0.11.0
-sklearn==0.0
-Pillow==9.0.1
-matplotlib==3.5.1
-numpy==1.19.5
+# Install with: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu1126
+--index-url https://download.pytorch.org/whl/cu1126
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Quantum Computing
+pennylane>=0.30.0
+
+# Scientific Computing
+numpy>=1.21.0
+scipy>=1.8.0
+
+# Machine Learning Utilities
+scikit-learn>=1.0.0
+
+# Visualization
+matplotlib>=3.5.0
+Pillow>=9.0.0
+
+# Jupyter Support (optional, for notebooks)
+jupyter>=1.0.0
+ipykernel>=6.0.0
