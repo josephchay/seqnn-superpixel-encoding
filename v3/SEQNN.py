@@ -1854,18 +1854,33 @@ n_classes = train_y.shape[-1]
 print(f"\n  Channels: {n_channels}, Classes: {n_classes}")
 
 
-# In[19]:
+# In[6]:
 
 
-# Visualize sample images
-def visualize_samples(images, labels, categories, n_samples=5):
-    """Display sample images with labels."""
-    fig, axes = plt.subplots(1, n_samples, figsize=(15, 3))
+# Visualize one sample per class
+def visualize_samples_per_class(images, labels, categories):
+    """Display one sample image from each class."""
+    n_classes = len(categories)
+    fig, axes = plt.subplots(1, n_classes, figsize=(n_classes * 2.5, 3))
 
-    for i in range(n_samples):
-        img = images[i]
-        label_idx = np.argmax(labels[i])
-        label_name = categories[label_idx] if label_idx < len(categories) else str(label_idx)
+    # Handle single class case
+    if n_classes == 1:
+        axes = [axes]
+
+    # Find one sample per class
+    shown_classes = {}
+    for i, label in enumerate(labels):
+        class_idx = np.argmax(label)
+        if class_idx not in shown_classes:
+            shown_classes[class_idx] = i
+        if len(shown_classes) == n_classes:
+            break
+
+    # Display images sorted by class index
+    for class_idx in sorted(shown_classes.keys()):
+        img_idx = shown_classes[class_idx]
+        img = images[img_idx]
+        label_name = categories[class_idx] if class_idx < len(categories) else str(class_idx)
 
         # Display image (use first 3 channels for RGB)
         if img.shape[-1] >= 3:
@@ -1873,15 +1888,18 @@ def visualize_samples(images, labels, categories, n_samples=5):
         else:
             display_img = img[:, :, 0]
 
-        axes[i].imshow(display_img, cmap='gray' if display_img.ndim == 2 else None)
-        axes[i].set_title(f"Class: {label_name}")
-        axes[i].axis('off')
+        ax = axes[class_idx]
+        ax.imshow(display_img, cmap='gray' if display_img.ndim == 2 else None)
+        ax.set_title(f"{label_name}", fontsize=10)
+        ax.axis('off')
 
+    plt.suptitle(f"Sample from each class ({n_classes} classes)", fontsize=12)
     plt.tight_layout()
     plt.show()
 
+# Usage
 categories = dataloader.get_categories()
-visualize_samples(train_x, train_y, categories)
+visualize_samples_per_class(train_x, train_y, categories)
 
 
 # ## 3. Build SEQNN Model
