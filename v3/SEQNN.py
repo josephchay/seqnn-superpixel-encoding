@@ -246,14 +246,20 @@ def parse_args():
     parser.add_argument(
         '--save-dir',
         type=str,
-        default='trained_models',
-        help='Directory to save trained models'
+        default='models',
+        help='Base directory to save trained models'
     )
     parser.add_argument(
         '--save-name',
         type=str,
         default=None,
         help='Custom name for saved model (default: seqnn_{dataset}.pt)'
+    )
+    parser.add_argument(
+        '--version',
+        type=str,
+        default=None,
+        help='Model version (default: auto-increment v1, v2, etc.)'
     )
     parser.add_argument(
         '--no-save',
@@ -328,7 +334,7 @@ def parse_args():
     return args
 
 
-def print_args(args):
+def print_args(args, version_dir=None):
     """Print parsed arguments in a formatted way."""
     logger.info("=" * 60)
     logger.info("CONFIGURATION")
@@ -342,9 +348,99 @@ def print_args(args):
     logger.info(f"  Use GPU:        {not args.no_gpu}")
     logger.info(f"  Use AMP:        {not args.no_amp}")
     logger.info(f"  Seed:           {args.seed}")
-    logger.info(f"  Save directory: {args.save_dir}")
+    logger.info(f"  Save directory: {version_dir or args.save_dir}")
     logger.info(f"  Log level:      {args.log_level}")
     logger.info("=" * 60)
+
+
+def get_version_dir(base_dir: str, version: str = None, dataset: str = None) -> str:
+    """
+    Get or create a versioned directory for saving models.
+
+    Directory structure: {base_dir}/{dataset}/v{N}/
+    Example: models/sat/v1/, models/sat/v2/, etc.
+
+    Args:
+        base_dir: Base directory for models (e.g., 'models')
+        version: Specific version to use (e.g., 'v1', '1', or None for auto)
+        dataset: Dataset name for subdirectory
+
+    Returns:
+        Path to the versioned directory
+    """
+    import re
+
+    # Create dataset subdirectory
+    if dataset:
+        base_dir = os.path.join(base_dir, dataset)
+
+    # Create base directory if it doesn't exist
+    os.makedirs(base_dir, exist_ok=True)
+
+    # If specific version provided, use it
+    if version:
+        # Normalize version string (add 'v' prefix if just a number)
+        if version.isdigit():
+            version = f"v{version}"
+        elif not version.startswith('v'):
+            version = f"v{version}"
+
+        version_dir = os.path.join(base_dir, version)
+        os.makedirs(version_dir, exist_ok=True)
+        logger.info(f"Using specified version directory: {version_dir}")
+        return version_dir
+
+    # Auto-increment version
+    existing_versions = []
+    if os.path.exists(base_dir):
+        for item in os.listdir(base_dir):
+            item_path = os.path.join(base_dir, item)
+            if os.path.isdir(item_path):
+                # Match v1, v2, v10, etc.
+                match = re.match(r'^v(\d+)$', item)
+                if match:
+                    existing_versions.append(int(match.group(1)))
+
+    # Determine next version number
+    if existing_versions:
+        next_version = max(existing_versions) + 1
+    else:
+        next_version = 1
+
+    version_dir = os.path.join(base_dir, f"v{next_version}")
+    os.makedirs(version_dir, exist_ok=True)
+    logger.info(f"Created new version directory: {version_dir}")
+
+    return version_dir
+
+
+def save_training_config(version_dir: str, args, config, additional_info: dict = None):
+    """
+    Save training configuration to a JSON file in the version directory.
+
+    Args:
+        version_dir: Path to version directory
+        args: Parsed arguments
+        config: SEQNNConfig object
+        additional_info: Additional information to save
+    """
+    import json
+
+    config_data = {
+        'version': os.path.basename(version_dir),
+        'timestamp': datetime.now().isoformat(),
+        'args': vars(args),
+        'config': config.__dict__,
+    }
+
+    if additional_info:
+        config_data.update(additional_info)
+
+    config_path = os.path.join(version_dir, 'config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config_data, f, indent=2, default=str)
+
+    logger.info(f"Training config saved to: {config_path}")
 
 
 # =============================================================================
@@ -2231,8 +2327,17 @@ def main(args=None):
     logger.info("Paper: Fan et al., IEEE TNNLS, Vol. 36, No. 6, June 2025")
     logger.info("=" * 60)
 
+    # Setup versioned output directory
+    version_dir = None
+    if not args.no_save:
+        version_dir = get_version_dir(
+            base_dir=args.save_dir,
+            version=args.version,
+            dataset=args.dataset
+        )
+
     # Print configuration
-    print_args(args)
+    print_args(args, version_dir)
 
     # Set random seed for reproducibility
     logger.info(f"Setting random seed: {args.seed}")
@@ -2314,12 +2419,27 @@ def main(args=None):
         logger.info(f"  Test Accuracy: {test_acc:.4f}")
         return {'test_loss': test_loss, 'test_acc': test_acc}
 
+    # Save training configuration
+    if version_dir:
+        save_training_config(
+            version_dir=version_dir,
+            args=args,
+            config=config,
+            additional_info={
+                'n_classes': n_classes,
+                'n_channels': n_channels,
+                'categories': categories,
+                'train_samples': len(train_x),
+                'valid_samples': len(valid_x),
+                'test_samples': len(test_x),
+            }
+        )
+
     # Train the model
     save_path = None
-    if not args.no_save:
-        os.makedirs(args.save_dir, exist_ok=True)
-        save_name = args.save_name or f'seqnn_{args.dataset}_best.pt'
-        save_path = os.path.join(args.save_dir, save_name)
+    if version_dir:
+        save_name = args.save_name or 'model_best.pt'
+        save_path = os.path.join(version_dir, save_name)
 
     history = trainer.fit(
         train_x, train_y,
@@ -2361,12 +2481,10 @@ def main(args=None):
         logger.info(f"  Paper Params:    {paper['params']}")
         logger.info(f"  Our Params:      {model.count_parameters()}")
 
-    # Save final model
-    if not args.no_save:
-        final_save_name = args.save_name or f'seqnn_{args.dataset}_final.pt'
-        final_save_name = final_save_name.replace('_best.pt', '_final.pt')
-        final_path = os.path.join(args.save_dir, final_save_name)
-
+    # Save final model and training history
+    if version_dir:
+        # Save final model
+        final_path = os.path.join(version_dir, 'model_final.pt')
         torch.save({
             'model_state_dict': model.state_dict(),
             'config': config.__dict__,
@@ -2377,6 +2495,32 @@ def main(args=None):
             'history': history,
         }, final_path)
         logger.info(f"Final model saved to: {final_path}")
+
+        # Save training history separately for easy access
+        import json
+        history_path = os.path.join(version_dir, 'history.json')
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
+        logger.info(f"Training history saved to: {history_path}")
+
+        # Save results summary
+        results_path = os.path.join(version_dir, 'results.json')
+        results = {
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'valid_loss': valid_loss,
+            'valid_acc': valid_acc,
+            'test_loss': test_loss,
+            'test_acc': test_acc,
+            'best_val_acc': max(history['val_acc']) if history['val_acc'] else None,
+            'best_epoch': history['val_acc'].index(max(history['val_acc'])) + 1 if history['val_acc'] else None,
+            'total_epochs': len(history['train_loss']),
+        }
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"Results summary saved to: {results_path}")
+
+        logger.info(f"\nAll outputs saved to: {version_dir}")
 
     logger.info("=" * 60)
     logger.info("TRAINING COMPLETE")
