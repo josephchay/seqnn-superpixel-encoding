@@ -16,3 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Updated the `load_batch` function in `get_cifar10_data` function in `seqnn_dataLoader.py` file.
 - Updated the `requirements.txt` file from original codebase of using TensorFlow to PyTorch.
+
+### Fixed
+- Display of `parser` arguments in the `v3/SEQNN.py` and `v4/SEQNN.py` files.
