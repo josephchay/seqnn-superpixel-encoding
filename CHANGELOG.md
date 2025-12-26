@@ -12,10 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Version 2 of the SEQNN notebook, but results from the training has low accuracy for CIFAR-10 dataset.
 - Index-url for the `requirements.txt` file for CUDA 12.6.
 - Jax version for the `requirements.txt` file. (Not compatible with CUDA 12.6)
+- More details for generated `config.json` file in `models/{dataset}/` directory.
 
 ### Changed
 - Updated the `load_batch` function in `get_cifar10_data` function in `seqnn_dataLoader.py` file.
 - Updated the `requirements.txt` file from original codebase of using TensorFlow to PyTorch.
-
-### Fixed
-- Display of `parser` arguments in the `v3/SEQNN.py` and `v4/SEQNN.py` files.
+- Updated `print_args` function in `v4/SEQNN.py` file.
