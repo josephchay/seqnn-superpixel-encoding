@@ -2,9 +2,10 @@
 torch>=2.0.0
 torchvision>=0.15.0
 
-jax
-
 pennylane>=0.30.0
+pennylane-lightning>=0.30.0
+# pennylane-lightning-gpu
+# cuquantum-cu12
 
 numpy>=1.21.0
 scipy>=1.8.0
@@ -13,3 +14,6 @@ matplotlib>=3.5.0
 Pillow>=9.0.0
 jupyter>=1.0.0
 ipykernel>=6.0.0
+
+# For Notebook and Python conversions
+# jupytext>=1.18.1
