@@ -659,60 +659,28 @@ import time
 import sys
 from functools import wraps
 
-# Custom log level for crucial terminal output (between WARNING and ERROR)
-CRUCIAL = 35
-logging.addLevelName(CRUCIAL, 'CRUCIAL')
 
-def crucial(self, message, *args, **kwargs):
-    """Log crucial messages that should appear in terminal."""
-    if self.isEnabledFor(CRUCIAL):
-        self._log(CRUCIAL, message, args, **kwargs)
-
-logging.Logger.crucial = crucial
-
-
-class CrucialOnlyFilter(logging.Filter):
-    """Filter that only allows CRUCIAL level and above."""
-    def filter(self, record):
-        return record.levelno >= CRUCIAL
-
-
-def setup_logger(name: str = "SEQNN", level: int = logging.INFO, quiet_console: bool = False) -> logging.Logger:
+def setup_logger(name: str = "SEQNN", level: int = logging.INFO) -> logging.Logger:
     """
-    Setup and return a configured logger.
+    Setup and return a configured logger (file-only, no console output).
 
     Args:
         name: Logger name
         level: Logging level
-        quiet_console: If True, only show CRUCIAL level messages in console
     """
     logger = logging.getLogger(name)
-    if not logger.handlers:
-        logger.setLevel(level)
-        console_handler = logging.StreamHandler()
-        if quiet_console:
-            # Only show crucial messages in console
-            console_handler.setLevel(CRUCIAL)
-            console_handler.addFilter(CrucialOnlyFilter())
-        else:
-            console_handler.setLevel(level)
-        formatter = logging.Formatter(
-            '[%(asctime)s] [%(levelname)s] %(message)s',
-            datefmt='%H:%M:%S'
-        )
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+    logger.setLevel(level)
+    # No handlers added here - file handler added later via configure_file_logging
     return logger
 
 
-def configure_file_logging(logger: logging.Logger, output_dir: str, quiet_console: bool = True) -> str:
+def configure_file_logging(logger: logging.Logger, output_dir: str) -> str:
     """
     Configure file logging to write all logs to output directory.
 
     Args:
         logger: The logger to configure
         output_dir: Directory to save log file
-        quiet_console: If True, reduce console output to crucial info only
 
     Returns:
         Path to the log file
@@ -724,7 +692,7 @@ def configure_file_logging(logger: logging.Logger, output_dir: str, quiet_consol
     log_filename = f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_path = os.path.join(output_dir, log_filename)
 
-    # Add file handler for all logs
+    # Add file handler for all logs (file only, no console)
     file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)  # Capture everything in file
     file_formatter = logging.Formatter(
@@ -734,17 +702,10 @@ def configure_file_logging(logger: logging.Logger, output_dir: str, quiet_consol
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
 
-    # Reconfigure console handler if quiet_console
-    if quiet_console:
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
-                handler.setLevel(CRUCIAL)
-                handler.addFilter(CrucialOnlyFilter())
-
     return log_path
 
 
-# Initialize logger (will be reconfigured with file handler later)
+# Initialize logger (file handler added later via configure_file_logging)
 logger = setup_logger("SEQNN")
 
 
@@ -1424,9 +1385,12 @@ class SEQNNTrainer:
             save_best: Path to save best model weights
             use_amp: Use automatic mixed precision (CUDA only)
         """
-        logger.crucial("=" * 60)
-        logger.crucial("STARTING TRAINING")
-        logger.crucial("=" * 60)
+        print("=" * 60)
+        print("STARTING TRAINING")
+        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("STARTING TRAINING")
+        logger.info("=" * 60)
         logger.info(f"  Training samples: {len(train_x)}")
         logger.info(f"  Validation samples: {len(val_x) if val_x is not None else 0}")
         logger.info(f"  Epochs: {epochs}")
@@ -1526,14 +1490,19 @@ class SEQNNTrainer:
                 if save_best and val_acc > best_val_acc:
                     best_val_acc = val_acc
                     torch.save(self.model.state_dict(), save_best)
-                    logger.crucial(f"  New best model saved! (val_acc: {val_acc:.4f})")
+                    print(f"  New best model saved! (val_acc: {val_acc:.4f})")
+                    logger.info(f"  New best model saved! (val_acc: {val_acc:.4f})")
 
-                logger.crucial(f"Epoch {epoch+1}/{epochs} completed in {epoch_time:.1f}s - "
-                              f"loss: {train_loss:.4f} - acc: {train_acc:.4f} - "
-                              f"val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f}")
+                epoch_msg = (f"Epoch {epoch+1}/{epochs} - {epoch_time:.1f}s - "
+                            f"loss: {train_loss:.4f} - acc: {train_acc:.4f} - "
+                            f"val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f}")
+                print(epoch_msg)
+                logger.info(epoch_msg)
             else:
-                logger.crucial(f"Epoch {epoch+1}/{epochs} completed in {epoch_time:.1f}s - "
-                              f"loss: {train_loss:.4f} - acc: {train_acc:.4f}")
+                epoch_msg = (f"Epoch {epoch+1}/{epochs} - {epoch_time:.1f}s - "
+                            f"loss: {train_loss:.4f} - acc: {train_acc:.4f}")
+                print(epoch_msg)
+                logger.info(epoch_msg)
 
             # Estimate remaining time
             elapsed = time.time() - training_start_time
@@ -1543,11 +1512,16 @@ class SEQNNTrainer:
             logger.info("-" * 60)
 
         total_time = time.time() - training_start_time
-        logger.crucial("=" * 60)
-        logger.crucial("TRAINING COMPLETED")
-        logger.crucial(f"  Total training time: {total_time/60:.2f} minutes")
-        logger.crucial(f"  Best validation accuracy: {best_val_acc:.4f}")
-        logger.crucial("=" * 60)
+        print("=" * 60)
+        print("TRAINING COMPLETED")
+        print(f"  Total training time: {total_time/60:.2f} minutes")
+        print(f"  Best validation accuracy: {best_val_acc:.4f}")
+        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("TRAINING COMPLETED")
+        logger.info(f"  Total training time: {total_time/60:.2f} minutes")
+        logger.info(f"  Best validation accuracy: {best_val_acc:.4f}")
+        logger.info("=" * 60)
 
         return self.history
 
@@ -2567,24 +2541,24 @@ def main(args=None):
             version=args.version,
             dataset=args.dataset
         )
-        # Configure file logging - all logs go to file, only crucial to console
-        log_path = configure_file_logging(logger, version_dir, quiet_console=True)
-        logger.crucial(f"Logging to: {log_path}")
+        # Configure file logging - all logs go to file only
+        log_path = configure_file_logging(logger, version_dir)
+        print(f"Logging to: {log_path}")
 
     # Configure logging level for file handler
     log_level = getattr(logging, args.log_level.upper())
     logger.setLevel(log_level)
 
-    # Print banner (goes to file only after file logging is configured)
+    # Log banner to file
     logger.info("=" * 60)
     logger.info("SEQNN: Superpixel Encoding Quantum Neural Network")
     logger.info("Paper: Fan et al., IEEE TNNLS, Vol. 36, No. 6, June 2025")
     logger.info("=" * 60)
 
-    # Log system information
+    # Log system information to file
     log_system_info()
 
-    # Print configuration (goes to log file)
+    # Log configuration to file
     print_args(args, version_dir)
 
     # Set random seed for reproducibility
@@ -2658,13 +2632,19 @@ def main(args=None):
 
     # Evaluation only mode
     if args.eval_only:
-        logger.crucial("Running evaluation only...")
+        print("Running evaluation only...")
+        logger.info("Running evaluation only...")
         test_loss, test_acc = trainer.evaluate(test_x, test_y, batch_size=args.batch_size)
-        logger.crucial("=" * 60)
-        logger.crucial("EVALUATION RESULTS")
-        logger.crucial("=" * 60)
-        logger.crucial(f"  Test Loss:     {test_loss:.4f}")
-        logger.crucial(f"  Test Accuracy: {test_acc:.4f}")
+        print("=" * 60)
+        print("EVALUATION RESULTS")
+        print("=" * 60)
+        print(f"  Test Loss:     {test_loss:.4f}")
+        print(f"  Test Accuracy: {test_acc:.4f}")
+        logger.info("=" * 60)
+        logger.info("EVALUATION RESULTS")
+        logger.info("=" * 60)
+        logger.info(f"  Test Loss:     {test_loss:.4f}")
+        logger.info(f"  Test Accuracy: {test_acc:.4f}")
         return {'test_loss': test_loss, 'test_acc': test_acc}
 
     # Save training configuration
@@ -2700,18 +2680,24 @@ def main(args=None):
     )
 
     # Final evaluation
-    logger.crucial("=" * 60)
-    logger.crucial("FINAL EVALUATION")
-    logger.crucial("=" * 60)
+    print("=" * 60)
+    print("FINAL EVALUATION")
+    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("FINAL EVALUATION")
+    logger.info("=" * 60)
 
     train_loss, train_acc = trainer.evaluate(train_x, train_y, batch_size=args.batch_size)
-    logger.crucial(f"  Training   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
+    print(f"  Training   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
+    logger.info(f"  Training   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
 
     valid_loss, valid_acc = trainer.evaluate(valid_x, valid_y, batch_size=args.batch_size)
-    logger.crucial(f"  Validation - Loss: {valid_loss:.4f}, Accuracy: {valid_acc:.4f}")
+    print(f"  Validation - Loss: {valid_loss:.4f}, Accuracy: {valid_acc:.4f}")
+    logger.info(f"  Validation - Loss: {valid_loss:.4f}, Accuracy: {valid_acc:.4f}")
 
     test_loss, test_acc = trainer.evaluate(test_x, test_y, batch_size=args.batch_size)
-    logger.crucial(f"  Test       - Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
+    print(f"  Test       - Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
+    logger.info(f"  Test       - Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
 
     # Compare with paper results
     paper_results = {
@@ -2768,11 +2754,15 @@ def main(args=None):
             json.dump(results, f, indent=2)
         logger.info(f"Results summary saved to: {results_path}")
 
-        logger.crucial(f"\nAll outputs saved to: {version_dir}")
+        print(f"\nAll outputs saved to: {version_dir}")
+        logger.info(f"All outputs saved to: {version_dir}")
 
-    logger.crucial("=" * 60)
-    logger.crucial("TRAINING COMPLETE")
-    logger.crucial("=" * 60)
+    print("=" * 60)
+    print("TRAINING COMPLETE")
+    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("TRAINING COMPLETE")
+    logger.info("=" * 60)
 
     return {
         'model': model,
