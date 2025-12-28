@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Index-url for the `requirements.txt` file for CUDA 12.6.
 - Jax version for the `requirements.txt` file. (Not compatible with CUDA 12.6)
 - More details for generated `config.json` file in `models/{dataset}/` directory.
+- `v7` for `WSL2` and local device GPU usage compatibility.
 
 ### Changed
 - Updated the `load_batch` function in `get_cifar10_data` function in `seqnn_dataLoader.py` file.

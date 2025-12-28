@@ -4,8 +4,9 @@ torchvision>=0.15.0
 
 pennylane>=0.30.0
 pennylane-lightning>=0.30.0
-# pennylane-lightning-gpu
-# cuquantum-cu12
+# For quantum GPU on WSL or Linux (optional)
+pennylane-lightning-gpu
+cuquantum-cu12
 
 numpy>=1.21.0
 scipy>=1.8.0

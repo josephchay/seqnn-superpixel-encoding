@@ -8,10 +8,21 @@ This paper introduces a hybrid quantum deep learning model (SEQNN) that effectiv
 
 ## Datasets
 
-   - Overhead-MNIST: https://syncandshare.lrz.de/getlink/fiXGu9L5yBb8Sk8yuHnEnq/ (outdated)
-   - So2Sat LCZ42: https://syncandshare.lrz.de/getlink/fiKfantyTRUVgeowgQzcAK/ (outdated)
-   - SAT-6: https://syncandshare.lrz.de/getlink/fi69y5zbjG9SNAeknfPPwQ/ (outdated)
-   - CIFAR-10/CIFAR-100: https://www.cs.toronto.edu/~kriz/cifar.html
+- Overhead-MNIST: https://syncandshare.lrz.de/getlink/fiXGu9L5yBb8Sk8yuHnEnq/ (outdated)
+- So2Sat LCZ42: https://syncandshare.lrz.de/getlink/fiKfantyTRUVgeowgQzcAK/ (outdated)
+- SAT-6: https://syncandshare.lrz.de/getlink/fi69y5zbjG9SNAeknfPPwQ/ (outdated)
+- CIFAR-10/CIFAR-100: https://www.cs.toronto.edu/~kriz/cifar.html
+
+## Installation
+
+For native Windows: Use SimulatedQuantumLayer (classical mode) - it's GPU-accelerated via PyTorch and works perfectly on Windows.
+For quantum GPU on Windows: Use WSL2 (Ubuntu) where you can install the Linux packages:
+
+### Requirements
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Usage
 

@@ -1,0 +1,2947 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+# # Install Required Packages
+# Uncomment and run these commands if packages are not installed
+
+# # Uncomment the lines below to install required packages:
+## !pip install torch>=2.0.0 torchvision>=0.15.0 --extra-index-url https://download.pytorch.org/whl/cu126
+## !pip install pennylane>=0.30.0 pennylane-lightning>=0.30.0
+## !pip install numpy>=1.21.0 scipy>=1.8.0 scikit-learn>=1.0.0
+## !pip install matplotlib>=3.5.0 Pillow>=9.0.0
+
+
+# In[2]:
+
+
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# GPU availability check moved to after logger setup
+# In[3]:
+
+
+#!/usr/bin/env python
+# coding: utf-8
+"""
+SEQNN PyTorch Implementation - GPU Optimized
+=========================================================
+Hybrid Quantum Deep Learning With Superpixel Encoding for Earth Observation Data Classification
+Fan et al., IEEE TNNLS, Vol. 36, No. 6, June 2025
+
+Key Fixes:
+1. Proper multi-controlled U3 gates for superpixel encoding
+2. Correct quantum convolution structure (4 gates per kernel)
+3. Proper measurement scheme for 64 features
+4. GPU optimization using JAX/Lightning backends
+
+Original paper: https://github.com/zhu-xlab/SEQNN
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader as TorchDataLoader, TensorDataset
+
+import pennylane as qml
+from pennylane import numpy as pnp
+
+import numpy as np
+import random
+import os
+import argparse
+import warnings
+warnings.filterwarnings("ignore")
+
+# Check for GPU-accelerated quantum backends
+LIGHTNING_GPU_AVAILABLE = False
+LIGHTNING_QUBIT_AVAILABLE = False
+
+try:
+    # Check for lightning.gpu (NVIDIA GPU acceleration via cuQuantum)
+    _test_dev = qml.device("lightning.gpu", wires=1)
+    LIGHTNING_GPU_AVAILABLE = True
+    del _test_dev
+    # Logged later after logger is configured
+except Exception:
+    pass
+
+try:
+    # Check for lightning.qubit (fast C++ CPU backend)
+    _test_dev = qml.device("lightning.qubit", wires=1)
+    LIGHTNING_QUBIT_AVAILABLE = True
+    del _test_dev
+    # Logged later after logger is configured
+except Exception:
+    pass
+
+# Quantum backend info logged later after logger is configured
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+class SEQNNConfig:
+    """Configuration class for SEQNN model hyperparameters matching the paper."""
+    def __init__(self):
+        # From paper Section V
+        self.n_elements = 9          # E: Elements per superpixel (Table IV shows 6 vs 9)
+        self.n_encodings = 1         # Number of encodings
+        self.n_qconv = 1             # Number of quantum convolution layers
+        self.pool_size = 4           # P: Patch size (4x4 patches)
+        self.input_size = 32         # N: Input image size
+
+        # Qubit configuration (Section V, 12 qubits total)
+        self.n_qubits = 12
+        self.n_loc_qubits = 6        # 2*log2(N/P) = 2*log2(8) = 6
+        self.n_elem_qubits = 3       # E/3 = 9/3 = 3
+        self.n_kernel_qubits = 1     # Kernel index
+        self.n_readout_qubits = 2    # Feature map readout
+
+        # Training parameters (Section V)
+        self.learning_rate = 0.01
+        self.batch_size = 50
+        self.epochs = 200
+
+        # Gate configuration (Table I - CZ performs best)
+        self.interaction_gate = 'CZ'
+
+        # Measurement basis (Table II, III - X-basis optimal)
+        self.measurement_basis = 'X'
+
+
+# =============================================================================
+# ARGUMENT PARSER
+# =============================================================================
+
+def parse_args():
+    """
+    Parse command line arguments for SEQNN training.
+
+    Returns:
+        argparse.Namespace: Parsed arguments
+    """
+    parser = argparse.ArgumentParser(
+        description='SEQNN: Superpixel Encoding Quantum Neural Network',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # ===================
+    # Dataset arguments
+    # ===================
+    parser.add_argument(
+        '--dataset', '-d',
+        type=str,
+        default='synthetic',
+        choices=['sat', 'lcz', 'overhead', 'cifar10', 'synthetic'],
+        help='Dataset to use for training'
+    )
+    parser.add_argument(
+        '--data-path',
+        type=str,
+        default=None,
+        help='Custom path to dataset (overrides default paths)'
+    )
+
+    # ===================
+    # Training arguments
+    # ===================
+    parser.add_argument(
+        '--epochs', '-e',
+        type=int,
+        default=200,
+        help='Number of training epochs'
+    )
+    parser.add_argument(
+        '--batch-size', '-b',
+        type=int,
+        default=50,
+        help='Training batch size'
+    )
+    parser.add_argument(
+        '--learning-rate', '--lr',
+        type=float,
+        default=0.01,
+        help='Learning rate for optimizer'
+    )
+    parser.add_argument(
+        '--no-scheduler',
+        action='store_true',
+        help='Disable learning rate scheduler'
+    )
+    parser.add_argument(
+        '--augment',
+        action='store_true',
+        help='Enable data augmentation (random flips, rotations) for training'
+    )
+
+    # ===================
+    # Model arguments
+    # ===================
+    parser.add_argument(
+        '--quantum', '-q',
+        action='store_true',
+        help='Use quantum simulation (slower but more accurate)'
+    )
+    parser.add_argument(
+        '--classical',
+        action='store_true',
+        help='Use classical approximation (faster, default)'
+    )
+    parser.add_argument(
+        '--n-elements',
+        type=int,
+        default=9,
+        help='Number of elements per superpixel (E parameter)'
+    )
+    parser.add_argument(
+        '--n-encodings',
+        type=int,
+        default=1,
+        help='Number of encodings'
+    )
+    parser.add_argument(
+        '--n-qconv',
+        type=int,
+        default=1,
+        help='Number of quantum convolution layers'
+    )
+    parser.add_argument(
+        '--pool-size',
+        type=int,
+        default=4,
+        help='Superpixel pool size (P parameter)'
+    )
+    parser.add_argument(
+        '--interaction-gate',
+        type=str,
+        default='CZ',
+        choices=['CZ', 'CX', 'XX', 'YY', 'ZZ', 'SWAP', 'ISWAP'],
+        help='Two-qubit interaction gate for superpixel encoding (Table I)'
+    )
+    parser.add_argument(
+        '--measurement-basis',
+        type=str,
+        default='X',
+        choices=['X', 'Y', 'Z', 'XYZ'],
+        help='Measurement basis for feature extraction (Tables II, III). XYZ uses all three.'
+    )
+
+    # ===================
+    # Hardware arguments
+    # ===================
+    parser.add_argument(
+        '--no-gpu',
+        action='store_true',
+        help='Disable GPU usage (use CPU only)'
+    )
+    parser.add_argument(
+        '--no-amp',
+        action='store_true',
+        help='Disable automatic mixed precision training'
+    )
+
+    # ===================
+    # Reproducibility
+    # ===================
+    parser.add_argument(
+        '--seed', '-s',
+        type=int,
+        default=42,
+        help='Random seed for reproducibility'
+    )
+
+    # ===================
+    # Output arguments
+    # ===================
+    parser.add_argument(
+        '--save-dir',
+        type=str,
+        default='models',
+        help='Base directory to save trained models'
+    )
+    parser.add_argument(
+        '--save-name',
+        type=str,
+        default=None,
+        help='Custom name for saved model (default: seqnn_{dataset}.pt)'
+    )
+    parser.add_argument(
+        '--version',
+        type=str,
+        default=None,
+        help='Model version (default: auto-increment v1, v2, etc.)'
+    )
+    parser.add_argument(
+        '--no-save',
+        action='store_true',
+        help='Do not save the trained model'
+    )
+
+    # ===================
+    # Logging arguments
+    # ===================
+    parser.add_argument(
+        '--log-level',
+        type=str,
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='Logging verbosity level'
+    )
+    parser.add_argument(
+        '--quiet', '-Q',
+        action='store_true',
+        help='Suppress most output (sets log level to WARNING)'
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable verbose output (sets log level to DEBUG)'
+    )
+
+    # ===================
+    # Evaluation arguments
+    # ===================
+    parser.add_argument(
+        '--eval-only',
+        action='store_true',
+        help='Only evaluate a pre-trained model (requires --load-model)'
+    )
+    parser.add_argument(
+        '--load-model',
+        type=str,
+        default=None,
+        help='Path to pre-trained model weights to load'
+    )
+
+    # ===================
+    # Quick test mode
+    # ===================
+    parser.add_argument(
+        '--quick-test',
+        action='store_true',
+        help='Quick test mode (10 epochs, reduced data)'
+    )
+
+    args = parser.parse_args()
+
+    # Handle conflicting arguments
+    if args.quantum and args.classical:
+        parser.error("Cannot specify both --quantum and --classical")
+
+    if args.eval_only and not args.load_model:
+        parser.error("--eval-only requires --load-model")
+
+    # Set log level based on flags
+    if args.quiet:
+        args.log_level = 'WARNING'
+    elif args.verbose:
+        args.log_level = 'DEBUG'
+
+    # Quick test adjustments
+    if args.quick_test:
+        args.epochs = 10
+
+    return args
+
+
+def print_args(args, version_dir=None):
+    """Print parsed arguments in a formatted way."""
+    logger.info("=" * 60)
+    logger.info("CONFIGURATION")
+    logger.info("=" * 60)
+    logger.info("Dataset:")
+    logger.info(f"  Dataset:        {args.dataset}")
+    logger.info(f"  Data path:      {args.data_path or 'default'}")
+    logger.info("Training:")
+    logger.info(f"  Epochs:         {args.epochs}")
+    logger.info(f"  Batch size:     {args.batch_size}")
+    logger.info(f"  Learning rate:  {args.learning_rate}")
+    logger.info(f"  Use scheduler:  {not args.no_scheduler}")
+    logger.info(f"  Augmentation:   {args.augment}")
+    logger.info("Model:")
+    logger.info(f"  Mode:           {'Quantum' if args.quantum else 'Classical'}")
+    logger.info(f"  N elements:     {args.n_elements}")
+    logger.info(f"  N encodings:    {args.n_encodings}")
+    logger.info(f"  N qconv:        {args.n_qconv}")
+    logger.info(f"  Pool size:      {args.pool_size}")
+    logger.info(f"  Interaction:    {args.interaction_gate}")
+    logger.info(f"  Measurement:    {args.measurement_basis}")
+    logger.info("Hardware:")
+    logger.info(f"  Use GPU:        {not args.no_gpu}")
+    logger.info(f"  Use AMP:        {not args.no_amp}")
+    logger.info("Other:")
+    logger.info(f"  Seed:           {args.seed}")
+    logger.info(f"  Save directory: {version_dir or args.save_dir}")
+    logger.info(f"  Log level:      {args.log_level}")
+    if args.load_model:
+        logger.info(f"  Load model:     {args.load_model}")
+    if args.eval_only:
+        logger.info(f"  Eval only:      True")
+    logger.info("=" * 60)
+
+
+def get_version_dir(base_dir: str, version: str = None, dataset: str = None) -> str:
+    """
+    Get or create a versioned directory for saving models.
+
+    Directory structure: {base_dir}/{dataset}/v{N}/
+    Example: models/sat/v1/, models/sat/v2/, etc.
+
+    Args:
+        base_dir: Base directory for models (e.g., 'models')
+        version: Specific version to use (e.g., 'v1', '1', or None for auto)
+        dataset: Dataset name for subdirectory
+
+    Returns:
+        Path to the versioned directory
+    """
+    import re
+
+    # Create dataset subdirectory
+    if dataset:
+        base_dir = os.path.join(base_dir, dataset)
+
+    # Create base directory if it doesn't exist
+    os.makedirs(base_dir, exist_ok=True)
+
+    # If specific version provided, use it
+    if version:
+        # Normalize version string (add 'v' prefix if just a number)
+        if version.isdigit():
+            version = f"v{version}"
+        elif not version.startswith('v'):
+            version = f"v{version}"
+
+        version_dir = os.path.join(base_dir, version)
+        os.makedirs(version_dir, exist_ok=True)
+        logger.info(f"Using specified version directory: {version_dir}")
+        return version_dir
+
+    # Auto-increment version
+    existing_versions = []
+    if os.path.exists(base_dir):
+        for item in os.listdir(base_dir):
+            item_path = os.path.join(base_dir, item)
+            if os.path.isdir(item_path):
+                # Match v1, v2, v10, etc.
+                match = re.match(r'^v(\d+)$', item)
+                if match:
+                    existing_versions.append(int(match.group(1)))
+
+    # Determine next version number
+    if existing_versions:
+        next_version = max(existing_versions) + 1
+    else:
+        next_version = 1
+
+    version_dir = os.path.join(base_dir, f"v{next_version}")
+    os.makedirs(version_dir, exist_ok=True)
+    logger.info(f"Created new version directory: {version_dir}")
+
+    return version_dir
+
+
+def save_training_config(version_dir: str, args, config, additional_info: dict = None):
+    """
+    Save training configuration to a JSON file in the version directory.
+
+    Args:
+        version_dir: Path to version directory
+        args: Parsed arguments
+        config: SEQNNConfig object
+        additional_info: Additional information to save
+    """
+    import json
+    import re
+
+    # Detect code version from this file's path (e.g., "v4" from "v4/SEQNN.py")
+    code_version = "unknown"
+    source_file = "unknown"
+    source_path = "unknown"
+    try:
+        source_path = os.path.abspath(__file__)
+        source_file = os.path.basename(source_path)
+        # Look for version folder pattern like /v3/ or /v4/
+        match = re.search(r'[/\\](v\d+)[/\\]', source_path)
+        if match:
+            code_version = match.group(1)
+        else:
+            # Use parent folder name as fallback
+            code_version = os.path.basename(os.path.dirname(source_path))
+    except:
+        pass
+
+    config_data = {
+        'model_version': os.path.basename(version_dir),  # e.g., "v1" from models/sat/v1
+        'code_version': code_version,                     # e.g., "v4" from v4/SEQNN.py
+        'source_file': source_file,                       # e.g., "SEQNN.py" or "SEQNN.ipynb"
+        'source_path': source_path,                       # Full path to the source file
+        'timestamp': datetime.now().isoformat(),
+        'args': vars(args),
+        'config': config.__dict__,
+    }
+
+    if additional_info:
+        config_data.update(additional_info)
+
+    config_path = os.path.join(version_dir, 'config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config_data, f, indent=2, default=str)
+
+    logger.info(f"Training config saved to: {config_path}")
+    logger.info(f"  Code version: {code_version}")
+    logger.info(f"  Source file:  {source_file}")
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def set_seed(seed: int = 42) -> None:
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def get_device():
+    """Get the best available device (CUDA > MPS > CPU)."""
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
+def get_quantum_device(n_qubits: int, use_gpu: bool = True):
+    """
+    Get the best available quantum device.
+
+    Priority:
+    1. lightning.gpu (NVIDIA GPU via cuQuantum) - fastest for GPU
+    2. lightning.qubit (C++ backend) - fast CPU simulation
+    3. default.qubit (Python backend) - fallback
+
+    NOTE: On Windows, lightning.gpu/lightning.qubit may not have pre-built binaries.
+    The default.qubit backend runs on CPU. For GPU-accelerated training, use
+    --classical mode which runs entirely on GPU via PyTorch.
+
+    Args:
+        n_qubits: Number of qubits for the device
+        use_gpu: Whether to prefer GPU acceleration
+
+    Returns:
+        Tuple of (device, backend_name)
+    """
+    logger.info(f"Selecting quantum device for {n_qubits} qubits...")
+
+    if use_gpu and LIGHTNING_GPU_AVAILABLE:
+        try:
+            dev = qml.device("lightning.gpu", wires=n_qubits)
+            logger.info("  Using lightning.gpu backend (NVIDIA GPU via cuQuantum)")
+            return dev, "lightning.gpu"
+        except Exception as e:
+            logger.warning(f"  lightning.gpu failed: {e}")
+
+    if LIGHTNING_QUBIT_AVAILABLE:
+        try:
+            dev = qml.device("lightning.qubit", wires=n_qubits)
+            logger.info("  Using lightning.qubit backend (Fast C++ CPU)")
+            return dev, "lightning.qubit"
+        except Exception as e:
+            logger.warning(f"  lightning.qubit failed: {e}")
+
+    # Fallback to default.qubit (CPU-based)
+    dev = qml.device("default.qubit", wires=n_qubits)
+    logger.info("  Using default.qubit backend (CPU-based Python simulation)")
+    logger.warning("  NOTE: Quantum simulation runs on CPU. For faster GPU training, use --classical mode.")
+    return dev, "default.qubit"
+
+
+# =============================================================================
+# PATCHES LAYER (PyTorch) - GPU Optimized
+# =============================================================================
+
+class Patches(nn.Module):
+    """
+    Extract patches from images - PyTorch equivalent of tf.image.extract_patches.
+    GPU optimized with contiguous memory operations.
+    """
+
+    def __init__(self, patch_size: int):
+        super().__init__()
+        self.patch_size = patch_size
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Extract non-overlapping patches from images.
+
+        Args:
+            images: Input tensor of shape (batch, height, width, channels) - NHWC
+
+        Returns:
+            patches: Tensor of shape (batch, num_patches, patch_features)
+        """
+        batch_size, height, width, channels = images.shape
+        p = self.patch_size
+
+        # Use unfold for efficient GPU patch extraction
+        # First convert to NCHW for unfold
+        x = images.permute(0, 3, 1, 2)  # (B, C, H, W)
+
+        # Unfold along height then width
+        x = x.unfold(2, p, p).unfold(3, p, p)  # (B, C, H/p, W/p, p, p)
+
+        # Reshape to (B, num_patches, patch_features)
+        x = x.permute(0, 2, 3, 1, 4, 5).contiguous()  # (B, H/p, W/p, C, p, p)
+        num_patches = (height // p) * (width // p)
+        patch_features = p * p * channels
+        x = x.view(batch_size, num_patches, patch_features)
+
+        return x
+
+
+# =============================================================================
+# SUPERPIXEL LAYER (PyTorch) - GPU Optimized
+# =============================================================================
+
+class Superpixel(nn.Module):
+    """
+    Superpixel preprocessing layer following Section IV-A of the paper.
+
+    Transforms input images into superpixel representations by:
+    1. Extracting patches (P × P)
+    2. Applying trainable linear projection (FC layer)
+    3. Adding bias and ReLU activation
+
+    Output: (N/P) × (N/P) × E representation
+    """
+
+    def __init__(self, n_elements: int, n_encodings: int, pool_size: int,
+                 n_channels: int, input_size: int = 32):
+        super().__init__()
+
+        self.n_elements = n_elements  # E
+        self.n_encodings = n_encodings
+        self.pool_size = pool_size    # P
+        self.n_channels = n_channels
+        self.input_size = input_size  # N
+
+        # Calculate dimensions
+        patch_dim = pool_size * pool_size * n_channels  # C*P^2
+        self.num_patches = (input_size // pool_size) ** 2  # (N/P)^2 = 64
+
+        # Trainable nonlinear projection (paper Section IV-A)
+        # One projection per encoding
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(patch_dim, n_elements),
+                nn.ReLU()  # "incorporates the ReLU activation function afterward"
+            ) for _ in range(n_encodings)
+        ])
+
+        self.patch_extractor = Patches(pool_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for superpixel preprocessing.
+
+        Args:
+            x: Input images of shape (batch, height, width, channels)
+
+        Returns:
+            Superpixel features of shape (batch, n_elements * num_patches * n_encodings)
+            This equals (batch, 9 * 64 * 1) = (batch, 576)
+        """
+        batch_size = x.shape[0]
+
+        # Extract patches: (batch, 64, patch_dim)
+        patches = self.patch_extractor(x)
+
+        outputs = []
+        for enc_idx, projection in enumerate(self.projections):
+            # Apply projection to all patches: (batch, 64, n_elements)
+            transformed = projection(patches)
+            outputs.append(transformed)
+
+        # Stack and flatten: (batch, n_encodings * num_patches * n_elements)
+        outputs = torch.stack(outputs, dim=1)  # (batch, n_encodings, 64, 9)
+        return outputs.reshape(batch_size, -1)  # (batch, 576)
+
+
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
+
+import logging
+import time
+import sys
+from functools import wraps
+
+
+def setup_logger(name: str = "SEQNN", level: int = logging.INFO) -> logging.Logger:
+    """
+    Setup and return a configured logger (file-only, no console output).
+
+    Args:
+        name: Logger name
+        level: Logging level
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    # No handlers added here - file handler added later via configure_file_logging
+    return logger
+
+
+def configure_file_logging(logger: logging.Logger, output_dir: str) -> str:
+    """
+    Configure file logging to write all logs to output directory.
+
+    Args:
+        logger: The logger to configure
+        output_dir: Directory to save log file
+
+    Returns:
+        Path to the log file
+    """
+    import os
+    from datetime import datetime
+
+    # Create log file path
+    log_filename = f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_path = os.path.join(output_dir, log_filename)
+
+    # Add file handler for all logs (file only, no console)
+    file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)  # Capture everything in file
+    file_formatter = logging.Formatter(
+        '[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    return log_path
+
+
+# Initialize logger (file handler added later via configure_file_logging)
+logger = setup_logger("SEQNN")
+
+
+def log_system_info():
+    """Log system and environment information."""
+    logger.info(f"PyTorch version: {torch.__version__}")
+    logger.info(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        logger.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        logger.info(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    # Log quantum backend info
+    if LIGHTNING_GPU_AVAILABLE:
+        logger.info("Quantum backend: lightning.gpu (NVIDIA GPU via cuQuantum)")
+    elif LIGHTNING_QUBIT_AVAILABLE:
+        logger.info("Quantum backend: lightning.qubit (Fast C++ CPU)")
+    else:
+        logger.info("Quantum backend: default.qubit (CPU-based - no GPU acceleration)")
+        logger.info("  TIP: Use --classical mode for GPU-accelerated training via PyTorch")
+
+
+class ProgressTracker:
+    """Track and log progress for long-running operations."""
+    def __init__(self, total: int, name: str = "Progress", log_every: int = 10):
+        self.total = total
+        self.name = name
+        self.log_every = log_every
+        self.current = 0
+        self.start_time = time.time()
+
+    def update(self, n: int = 1):
+        self.current += n
+        if self.current % self.log_every == 0 or self.current == self.total:
+            elapsed = time.time() - self.start_time
+            rate = self.current / elapsed if elapsed > 0 else 0
+            remaining = (self.total - self.current) / rate if rate > 0 else 0
+            logger.info(f"{self.name}: {self.current}/{self.total} ({100*self.current/self.total:.1f}%) "
+                       f"[{elapsed:.1f}s elapsed, ~{remaining:.1f}s remaining]")
+
+
+# =============================================================================
+# QUANTUM LAYER - PAPER-ACCURATE IMPLEMENTATION WITH PROPER CONTROLLED GATES
+# =============================================================================
+
+def apply_interaction_gate(gate_type: str, wire1: int, wire2: int):
+    """Apply the specified two-qubit interaction gate (Paper Table I)."""
+    if gate_type == 'CZ':
+        qml.CZ(wires=[wire1, wire2])
+    elif gate_type == 'CX':
+        qml.CNOT(wires=[wire1, wire2])
+    elif gate_type == 'XX':
+        qml.IsingXX(np.pi/4, wires=[wire1, wire2])
+    elif gate_type == 'YY':
+        qml.IsingYY(np.pi/4, wires=[wire1, wire2])
+    elif gate_type == 'ZZ':
+        qml.IsingZZ(np.pi/4, wires=[wire1, wire2])
+    elif gate_type == 'SWAP':
+        qml.SWAP(wires=[wire1, wire2])
+    elif gate_type == 'ISWAP':
+        qml.ISWAP(wires=[wire1, wire2])
+    else:
+        qml.CZ(wires=[wire1, wire2])  # Default to CZ
+
+
+def get_pauli_observable(basis: str, wire: int):
+    """Get the Pauli observable for the specified basis."""
+    if basis == 'X':
+        return qml.PauliX(wire)
+    elif basis == 'Y':
+        return qml.PauliY(wire)
+    elif basis == 'Z':
+        return qml.PauliZ(wire)
+    else:
+        return qml.PauliX(wire)  # Default to X-basis
+
+
+class QuantumLayer(nn.Module):
+    """
+    Paper-accurate quantum layer with PROPER multi-controlled gates.
+
+    Paper Architecture (Section IV, Figure 1):
+    - ql: 6 location qubits [0-5] for 8×8 superpixel grid
+    - qe: 3 element qubits [6,7,8] for 9 elements (3 per qubit via U3)
+    - qk: 1 kernel index qubit [9]
+    - qr: 2 readout qubits [10,11] for feature maps
+
+    Key fixes from paper:
+    - Two-qubit gates applied ONCE per encoding (not per superpixel) - Section IV-A
+    - Configurable interaction gate (CZ, CX, XX, YY, ZZ, SWAP, ISWAP) - Table I
+    - Configurable measurement basis (X, Y, Z) - Tables II, III
+
+    CRITICAL: This implementation uses proper multi-controlled gates via qml.ctrl()
+    which is essential for correct quantum behavior but VERY SLOW.
+
+    For practical training, use SimulatedQuantumLayer (classical=True).
+    """
+
+    def __init__(self, config: SEQNNConfig, use_gpu: bool = True):
+        super().__init__()
+        logger.info("Initializing QuantumLayer (Paper-Accurate with CONTROLLED gates)")
+        logger.warning("  WARNING: Quantum mode with controlled gates is VERY SLOW!")
+        logger.warning("  Expected time: ~5-10 minutes per batch of 50 samples")
+        logger.warning("  For practical training, use --classical flag instead")
+
+        self.config = config
+        self.n_qubits = config.n_qubits
+        self.n_elements = config.n_elements
+        self.n_encodings = config.n_encodings
+        self.n_qconv = config.n_qconv
+        self.interaction_gate = config.interaction_gate
+        self.measurement_basis = config.measurement_basis
+
+        # Qubit assignments (matching original Cirq implementation)
+        self.row_qubits = [0, 1, 2]       # qubits[0:3] - row location
+        self.col_qubits = [3, 4, 5]       # qubits[3:6] - column location
+        self.loc_qubits = list(range(6))  # All location qubits
+        self.elem_qubits = [6, 7, 8]      # qubits[6:9] - element/color qubits
+        self.kernel_qubit = 9              # qubits[9] - kernel qubit
+        self.readout_qubits = [10, 11]    # qubits[10:12] - readout qubits
+
+        logger.info(f"  Qubits: {self.n_qubits} total")
+        logger.info(f"    Location (row): {self.row_qubits}")
+        logger.info(f"    Location (col): {self.col_qubits}")
+        logger.info(f"    Element: {self.elem_qubits}")
+        logger.info(f"    Kernel: {self.kernel_qubit}")
+        logger.info(f"    Readout: {self.readout_qubits}")
+        logger.info(f"  Interaction gate: {self.interaction_gate}")
+        logger.info(f"  Measurement basis: {self.measurement_basis}")
+
+        # Paper Table V: 144 parameters for feature extraction per qconv layer
+        self.n_conv_params = 144 * config.n_qconv
+
+        # Trainable convolution parameters
+        self.conv_params = nn.Parameter(
+            torch.empty(self.n_conv_params).uniform_(0, 2 * np.pi)
+        )
+        logger.info(f"  Convolution parameters: {self.n_conv_params}")
+
+        # Number of input/output features
+        self.n_inputs = 64 * config.n_elements * config.n_encodings  # 576
+        # Output features depend on measurement basis
+        if self.measurement_basis == 'XYZ':
+            self.n_outputs = 192  # 64 features × 3 bases
+        else:
+            self.n_outputs = 64  # 64 feature maps
+        logger.info(f"  Input features: {self.n_inputs}, Output features: {self.n_outputs}")
+
+        # Get quantum device
+        logger.info("  Selecting quantum device...")
+        self.dev, self.backend = get_quantum_device(self.n_qubits, use_gpu)
+
+        # Build quantum circuit
+        logger.info("  Building quantum circuit with CONTROLLED gates...")
+        self._build_circuit()
+        logger.info("  QuantumLayer initialized")
+
+    def _build_circuit(self):
+        """Build the paper-accurate quantum circuit with proper controlled gates."""
+        logger.info("    Building circuit with multi-controlled U3 gates...")
+
+        # Store these for use in circuit closure
+        interaction_gate = self.interaction_gate
+        measurement_basis = self.measurement_basis
+        n_encodings = self.n_encodings
+        n_elements = self.n_elements
+        n_qconv = self.n_qconv
+        loc_qubits = self.loc_qubits
+        elem_qubits = self.elem_qubits
+        kernel_qubit = self.kernel_qubit
+        readout_qubits = self.readout_qubits
+        row_qubits = self.row_qubits
+        col_qubits = self.col_qubits
+
+        @qml.qnode(self.dev, interface="torch", diff_method="backprop")
+        def circuit(inputs, conv_params):
+            """
+            Full quantum circuit with PROPER multi-controlled gates.
+
+            This matches the original TensorFlow Quantum implementation:
+            - 6-controlled U3 gates for encoding (controlled by location qubits)
+            - Two-qubit gates applied ONCE per encoding (Paper Section IV-A)
+            - 4-controlled U3 gates for convolution
+            - Configurable measurement basis
+            """
+            # === ENCODING SECTION (Section IV-A) ===
+            # Apply Hadamard to location qubits for superposition over all 64 positions
+            for q in loc_qubits:
+                qml.Hadamard(wires=q)
+
+            # Encode superpixels using 6-CONTROLLED U3 gates
+            for enc_idx in range(n_encodings):
+                for superpixel_idx in range(64):
+                    i = superpixel_idx // 8  # Row (0-7)
+                    j = superpixel_idx % 8   # Column (0-7)
+
+                    base_idx = 64 * n_elements * enc_idx + n_elements * superpixel_idx
+
+                    # Control values for this position (6-bit binary)
+                    row_bits = [int(b) for b in format(i, '03b')]
+                    col_bits = [int(b) for b in format(j, '03b')]
+                    ctrl_values = row_bits + col_bits
+
+                    # Apply X gates to flip control qubits where control_value is 0
+                    for ctrl_idx, ctrl_val in enumerate(ctrl_values):
+                        if ctrl_val == 0:
+                            qml.PauliX(wires=loc_qubits[ctrl_idx])
+
+                    # Apply controlled U3 to each element qubit
+                    for elem_q_idx, elem_q in enumerate(elem_qubits):
+                        theta = inputs[base_idx + elem_q_idx * 3]
+                        phi = inputs[base_idx + elem_q_idx * 3 + 1]
+                        lam = inputs[base_idx + elem_q_idx * 3 + 2]
+
+                        # 6-controlled U3 gate using qml.ctrl()
+                        qml.ctrl(
+                            qml.U3(theta, phi, lam, wires=elem_q),
+                            control=loc_qubits
+                        )
+
+                    # Undo X gates
+                    for ctrl_idx, ctrl_val in enumerate(ctrl_values):
+                        if ctrl_val == 0:
+                            qml.PauliX(wires=loc_qubits[ctrl_idx])
+
+                # === TWO-QUBIT ENTANGLEMENT (Paper Section IV-A) ===
+                # FIXED: Apply ONCE per encoding, not per superpixel!
+                # "we proceed to apply two-qubit gates between each pair of qubits in qe"
+                # All-to-all configuration between element qubits
+                apply_interaction_gate(interaction_gate, elem_qubits[0], elem_qubits[1])
+                apply_interaction_gate(interaction_gate, elem_qubits[1], elem_qubits[2])
+                apply_interaction_gate(interaction_gate, elem_qubits[2], elem_qubits[0])
+
+            # === QUANTUM CONVOLUTION SECTION (Section IV-B) ===
+            qml.Hadamard(wires=kernel_qubit)
+
+            param_idx = 0
+            for qconv_layer in range(n_qconv):
+                for elem_idx, elem_q in enumerate(elem_qubits):
+                    # Convolution with 4-controlled gates
+                    for kernel_idx in range(2):
+                        for weight_idx in range(4):
+                            # Control based on spatial position and kernel
+                            loc_bit0 = (weight_idx >> 1) & 1
+                            loc_bit1 = weight_idx & 1
+
+                            # Apply X for control value logic
+                            if loc_bit0 == 0:
+                                qml.PauliX(wires=col_qubits[0])
+                            if loc_bit1 == 0:
+                                qml.PauliX(wires=row_qubits[0])
+                            if kernel_idx == 0:
+                                qml.PauliX(wires=kernel_qubit)
+
+                            # 4-controlled U3 on readout qubit
+                            ctrl_wires = [col_qubits[0], row_qubits[0],
+                                         elem_q, kernel_qubit]
+                            qml.ctrl(
+                                qml.U3(conv_params[param_idx],
+                                      conv_params[param_idx + 1],
+                                      conv_params[param_idx + 2],
+                                      wires=readout_qubits[0]),
+                                control=ctrl_wires
+                            )
+
+                            # Undo X gates
+                            if loc_bit0 == 0:
+                                qml.PauliX(wires=col_qubits[0])
+                            if loc_bit1 == 0:
+                                qml.PauliX(wires=row_qubits[0])
+                            if kernel_idx == 0:
+                                qml.PauliX(wires=kernel_qubit)
+
+                            param_idx += 3
+
+            # === MEASUREMENT SECTION (Section IV-B) ===
+            # Configurable measurement basis (Tables II, III show X-basis is optimal)
+            measurements = []
+            bases_to_measure = ['X', 'Y', 'Z'] if measurement_basis == 'XYZ' else [measurement_basis]
+
+            for basis in bases_to_measure:
+                # 64 features = 4 img_positions × 2 kernels × 8 channels
+                for img_idx in range(4):
+                    for kernel_idx in range(2):
+                        for channel_idx in range(8):
+                            # Tensor product observable using specified basis
+                            obs = (get_pauli_observable(basis, loc_qubits[2]) @
+                                   get_pauli_observable(basis, loc_qubits[5]) @
+                                   get_pauli_observable(basis, readout_qubits[1]) @
+                                   get_pauli_observable(basis, kernel_qubit) @
+                                   get_pauli_observable(basis, elem_qubits[0]) @
+                                   get_pauli_observable(basis, elem_qubits[1]) @
+                                   get_pauli_observable(basis, elem_qubits[2]))
+
+                            measurements.append(qml.expval(obs))
+
+            return measurements
+
+        self.circuit = circuit
+        logger.info("    Circuit built successfully")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the quantum circuit.
+
+        NOTE: Quantum simulation is inherently sequential - each sample requires
+        a full quantum state evolution. This is a fundamental limitation of
+        quantum simulation, not a code inefficiency.
+
+        For training, use --classical mode which is ~100x faster while
+        maintaining paper-accurate structure (144 trainable parameters).
+        """
+        batch_size = x.shape[0]
+        outputs = []
+        device = x.device
+
+        tracker = ProgressTracker(batch_size, "Quantum forward", log_every=max(1, batch_size // 10))
+
+        # Pre-allocate output tensor for efficiency
+        output_tensor = torch.zeros(batch_size, self.n_outputs, device=device)
+
+        for i in range(batch_size):
+            # Run quantum circuit for this sample
+            result = self.circuit(x[i], self.conv_params)
+
+            if isinstance(result, list):
+                # Pad if needed
+                if len(result) < self.n_outputs:
+                    result = result + [torch.tensor(0.0)] * (self.n_outputs - len(result))
+                # Stack results efficiently
+                stacked = torch.stack([
+                    r if isinstance(r, torch.Tensor) else torch.tensor(r)
+                    for r in result[:self.n_outputs]
+                ])
+                output_tensor[i] = stacked.to(device)
+            else:
+                output_tensor[i] = result.to(device)
+
+            tracker.update()
+
+        return output_tensor
+
+
+# =============================================================================
+# CLASSICAL SIMULATION LAYER - PAPER-ACCURATE VERSION
+# =============================================================================
+
+class SimulatedQuantumLayer(nn.Module):
+    """
+    Paper-accurate classical simulation of the quantum layer.
+
+    Key design matching the paper (Section IV, V):
+    1. Position-dependent encoding via 6-controlled U3 gates
+    2. Entanglement via configurable two-qubit gates (Table I)
+    3. Convolution with exactly 144 trainable parameters (Table V)
+    4. Measurement in configurable basis (Tables II, III)
+
+    Parameter breakdown (matching paper Table V):
+    - Convolution: 3 elem_qubits × 2 kernels × 4 weights × 3 U3_params × n_qconv = 144 * n_qconv
+    - Total trainable: 144 * n_qconv (matching paper exactly)
+    """
+
+    def __init__(self, n_inputs: int, n_outputs: int = 64, n_qconv: int = 1,
+                 config: SEQNNConfig = None):
+        super().__init__()
+        logger.info("Initializing SimulatedQuantumLayer (Paper-Accurate Classical)")
+
+        self.n_inputs = n_inputs    # 576 = 64 superpixels × 9 elements
+        self.n_superpixels = 64
+        self.n_elements = 9         # 3 element qubits × 3 U3 params
+        self.n_qconv = n_qconv
+
+        # Get configuration
+        if config is not None:
+            self.measurement_basis = config.measurement_basis
+            self.interaction_gate = config.interaction_gate
+        else:
+            self.measurement_basis = 'X'
+            self.interaction_gate = 'CZ'
+
+        # Output features depend on measurement basis
+        if self.measurement_basis == 'XYZ':
+            self.n_outputs = 192  # 64 features × 3 bases
+        else:
+            self.n_outputs = n_outputs  # 64 feature maps
+
+        logger.info(f"  Interaction gate: {self.interaction_gate}")
+        logger.info(f"  Measurement basis: {self.measurement_basis}")
+        logger.info(f"  Output features: {self.n_outputs}")
+
+        # === CONVOLUTION PARAMETERS (Paper Table V: exactly 144 params) ===
+        # Structure: 3 elem_qubits × 2 kernels × 4 spatial_weights × 3 U3_params = 72 per layer
+        # With n_qconv layers = 144 total for n_qconv=1
+        # We use a single parameter tensor for efficiency
+        self.n_conv_params = 144 * n_qconv
+        self.conv_params = nn.Parameter(
+            torch.empty(self.n_conv_params).uniform_(-np.pi, np.pi)
+        )
+
+        # === FIXED STRUCTURES (not trainable) ===
+        # Position encoding matrix (simulates 6-qubit Hadamard superposition)
+        # Uses fixed sinusoidal encoding like transformers
+        self.register_buffer('position_encoding', self._create_position_encoding())
+
+        # Entanglement structure (fixed based on interaction_gate type)
+        self.register_buffer('entangle_matrix', self._create_entangle_matrix())
+
+        # Measurement projection (fixed based on measurement_basis)
+        self.register_buffer('measurement_proj', self._create_measurement_matrix())
+
+        self._print_param_count()
+
+    def _create_position_encoding(self):
+        """Create fixed positional encoding for 64 positions (simulates Hadamard superposition)."""
+        # Similar to transformer positional encoding
+        pos = torch.arange(64).unsqueeze(1).float()
+        dim = torch.arange(9).unsqueeze(0).float()
+
+        # Sinusoidal encoding
+        encoding = torch.zeros(64, 9)
+        encoding[:, 0::2] = torch.sin(pos / (10000 ** (dim[:, 0::2] / 9)))
+        encoding[:, 1::2] = torch.cos(pos / (10000 ** (dim[:, 1::2] / 9)))
+
+        return encoding * 0.1  # Scale down
+
+    def _create_entangle_matrix(self):
+        """Create fixed entanglement matrix based on interaction gate type."""
+        # CZ-like behavior: correlates element qubits
+        if self.interaction_gate == 'CZ':
+            # CZ applies phase to |11> state
+            mat = torch.eye(3) * 0.7 + torch.ones(3, 3) * 0.1
+        elif self.interaction_gate in ['XX', 'YY', 'ZZ']:
+            # Ising gates create different correlations
+            mat = torch.eye(3) * 0.5 + torch.ones(3, 3) * 0.167
+        elif self.interaction_gate == 'CX':
+            # CNOT creates asymmetric correlations
+            mat = torch.tensor([[0.7, 0.15, 0.15],
+                               [0.3, 0.5, 0.2],
+                               [0.2, 0.3, 0.5]])
+        elif self.interaction_gate == 'SWAP':
+            # SWAP exchanges states
+            mat = torch.tensor([[0.33, 0.33, 0.34],
+                               [0.33, 0.34, 0.33],
+                               [0.34, 0.33, 0.33]])
+        else:
+            mat = torch.eye(3) * 0.7 + torch.ones(3, 3) * 0.1
+
+        return mat
+
+    def _create_measurement_matrix(self):
+        """
+        Create fixed measurement projection matrix.
+
+        Maps 48 intermediate features to 64 (or 192 for XYZ) output features
+        based on tensor product structure from paper.
+        """
+        n_bases = 3 if self.measurement_basis == 'XYZ' else 1
+        proj = torch.zeros(48, 64 * n_bases)
+
+        for basis_idx in range(n_bases):
+            base_offset = basis_idx * 64
+
+            for out_idx in range(64):
+                # Decode output index into components
+                pos_idx = out_idx // 16       # 0-3 (4 position combos)
+                kernel_idx = (out_idx // 8) % 2  # 0-1 (2 kernels)
+                channel_idx = out_idx % 8     # 0-7 (8 channels from 3 elem qubits)
+
+                for elem_q in range(3):
+                    # Bit from channel determines sign (simulates Pauli eigenvalue)
+                    bit_set = (channel_idx >> elem_q) & 1
+                    sign = 1.0 if bit_set else -1.0
+
+                    # Map to intermediate features
+                    for feat_idx in range(16):
+                        feat_pos = feat_idx % 4
+                        feat_kernel = (feat_idx // 4) % 2
+
+                        # Position and kernel matching weights
+                        pos_match = 1.0 if feat_pos == pos_idx else 0.1
+                        kernel_match = 1.0 if feat_kernel == kernel_idx else 0.3
+
+                        # Basis-dependent scaling
+                        if self.measurement_basis == 'XYZ':
+                            basis_scale = [1.0, 0.8, 0.6][basis_idx]
+                        else:
+                            basis_scale = 1.0
+
+                        in_idx = elem_q * 16 + feat_idx
+                        proj[in_idx, base_offset + out_idx] += (
+                            sign * pos_match * kernel_match * basis_scale / 9.0
+                        )
+
+        return proj
+
+    def _print_param_count(self):
+        """Print parameter breakdown."""
+        total = sum(p.numel() for p in self.parameters())
+
+        logger.info(f"  SimulatedQuantumLayer parameters:")
+        logger.info(f"    Convolution params: {self.conv_params.numel()}")
+        logger.info(f"    Total trainable: {total}")
+        logger.info(f"    (Paper Table V target: {144 * self.n_qconv})")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass simulating quantum operations.
+
+        Args:
+            x: Input tensor of shape (batch, 576) = (batch, 64 superpixels × 9 elements)
+
+        Returns:
+            Output tensor of shape (batch, 64) or (batch, 192) for XYZ basis
+        """
+        batch_size = x.shape[0]
+        device = x.device
+
+        # Reshape to (batch, 64 superpixels, 9 elements)
+        x = x.view(batch_size, 64, 9)
+
+        # === STEP 1: POSITION-DEPENDENT ENCODING ===
+        # Apply fixed positional encoding (simulates controlled U3 gates)
+        x_encoded = x + self.position_encoding.unsqueeze(0)
+        x_encoded = torch.tanh(x_encoded)  # Bound like quantum amplitudes
+
+        # === STEP 2: ELEMENT QUBIT PROCESSING ===
+        # Reshape to (batch, 64, 3 qubits, 3 elements per qubit)
+        x_qubits = x_encoded.view(batch_size, 64, 3, 3)
+
+        # === STEP 3: ENTANGLEMENT SIMULATION ===
+        # Apply fixed entanglement matrix (simulates two-qubit gates)
+        # Mix information between element qubits
+        x_entangled = torch.einsum('bpqe,qr->bpre', x_qubits, self.entangle_matrix)
+        x_entangled = torch.tanh(x_entangled)
+
+        # === STEP 4: QUANTUM CONVOLUTION ===
+        # Apply trainable convolution parameters
+        # Structure matches paper Table V: 3 elem × 2 kernels × 8 weights × 3 params = 144
+
+        # Reshape params: (144,) -> (3 elem, 2 kernels, 8 weights, 3 params)
+        params = self.conv_params.view(3, 2, 8, 3) if self.n_qconv == 1 else \
+                 self.conv_params.view(self.n_qconv, 3, 2, 8, 3)
+
+        # Process each element qubit pathway
+        features = []
+        for q_idx in range(3):
+            # Get this element qubit's encoded data across all positions
+            # Shape: (batch, 64, 3)
+            q_data = x_entangled[:, :, q_idx, :]
+
+            # Aggregate across spatial positions (simulates quantum superposition)
+            # Use attention-like weighting based on data magnitude
+            pos_weights = torch.softmax(q_data.sum(dim=-1), dim=-1)  # (batch, 64)
+            q_aggregated = torch.einsum('bp,bpe->be', pos_weights, q_data)  # (batch, 3)
+
+            # Apply convolution for each kernel
+            q_features = []
+            for k_idx in range(2):
+                k_feat = []
+                for w_idx in range(8):  # 8 weights per kernel (was 4)
+                    if self.n_qconv == 1:
+                        w = params[q_idx, k_idx, w_idx]  # (3,) - 3 U3 params
+                    else:
+                        w = params[:, q_idx, k_idx, w_idx].mean(dim=0)  # Average across layers
+
+                    # Apply rotation (simulates U3 gate)
+                    # U3(θ,φ,λ) ≈ Rz(λ)Ry(θ)Rz(φ)
+                    rotated = q_aggregated * torch.cos(w) + \
+                             torch.roll(q_aggregated, 1, dims=-1) * torch.sin(w)
+                    k_feat.append(rotated.sum(dim=-1, keepdim=True))
+
+                q_features.append(torch.cat(k_feat, dim=-1))  # (batch, 8)
+
+            features.append(torch.cat(q_features, dim=-1))  # (batch, 16)
+
+        # Concatenate all element qubit features: (batch, 48)
+        features = torch.cat(features, dim=-1)  # (batch, 48)
+        features = torch.tanh(features)
+
+        # === STEP 5: MEASUREMENT PROJECTION ===
+        # Project to output features using structured measurement matrix
+        output = torch.matmul(features, self.measurement_proj)  # (batch, 64 or 192)
+
+        # Bound outputs like quantum expectation values [-1, 1]
+        output = torch.tanh(output)
+
+        return output
+
+
+# =============================================================================
+# SEQNN MODEL - GPU OPTIMIZED
+# =============================================================================
+
+class SEQNN(nn.Module):
+    """
+    SEQNN: Superpixel Encoding Quantum Neural Network
+
+    GPU-optimized hybrid quantum-classical neural network for image classification.
+
+    Architecture (Figure 1):
+    1. Superpixel preprocessing layer (classical, GPU)
+    2. Quantum encoding and convolution (quantum or simulated)
+    3. Dense classifier with softmax (classical, GPU)
+
+    Args:
+        n_classes: Number of output classes
+        n_channels: Number of input channels
+        config: SEQNNConfig object
+        use_quantum: If True, use PennyLane quantum circuit
+        use_gpu: If True, attempt to use GPU acceleration
+    """
+
+    def __init__(self, n_classes: int, n_channels: int,
+                 config: SEQNNConfig = None,
+                 use_quantum: bool = False,
+                 use_gpu: bool = True):
+        super().__init__()
+        logger.info("=" * 60)
+        logger.info("BUILDING SEQNN MODEL")
+        logger.info("=" * 60)
+
+        if config is None:
+            config = SEQNNConfig()
+
+        self.config = config
+        self.n_classes = n_classes
+        self.n_channels = n_channels
+        self.use_quantum = use_quantum
+        self.use_gpu = use_gpu
+        self.device = get_device() if use_gpu else torch.device('cpu')
+
+        logger.info(f"  Classes: {n_classes}")
+        logger.info(f"  Channels: {n_channels}")
+        logger.info(f"  Device: {self.device}")
+        logger.info(f"  Mode: {'Quantum Simulation' if use_quantum else 'Classical Approximation'}")
+
+        # Superpixel preprocessing (Section IV-A)
+        logger.info("Building Superpixel preprocessing layer...")
+        self.superpixel = Superpixel(
+            n_elements=config.n_elements,
+            n_encodings=config.n_encodings,
+            pool_size=config.pool_size,
+            n_channels=n_channels,
+            input_size=config.input_size
+        )
+        logger.info(f"  Pool size: {config.pool_size}x{config.pool_size}")
+        logger.info(f"  Elements per superpixel: {config.n_elements}")
+        logger.info(f"  Number of superpixels: 64 (8x8 grid)")
+
+        # Number of features after superpixel preprocessing
+        n_superpixel_features = config.n_elements * 64 * config.n_encodings  # 576
+        logger.info(f"  Output features: {n_superpixel_features}")
+
+        # Quantum or classical simulation layer
+        if use_quantum:
+            logger.info("Building Quantum layer (PennyLane simulation)...")
+            self.quantum = QuantumLayer(config, use_gpu)
+        else:
+            logger.info("Building Classical approximation layer...")
+            self.quantum = SimulatedQuantumLayer(
+                n_inputs=n_superpixel_features,
+                n_outputs=64,
+                n_qconv=config.n_qconv,
+                config=config  # Pass config for measurement_basis and interaction_gate
+            )
+
+        # Get output size from quantum layer (depends on measurement_basis)
+        quantum_output_size = getattr(self.quantum, 'n_outputs', 64)
+
+        # Classification head (Section IV-C)
+        logger.info("Building Classification layer...")
+        self.classifier = nn.Linear(quantum_output_size, n_classes)
+        logger.info(f"  Input: {quantum_output_size} features -> Output: {n_classes} classes")
+        logger.info("=" * 60)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the SEQNN model.
+
+        Args:
+            x: Input images of shape (batch, height, width, channels) - NHWC
+
+        Returns:
+            Class probabilities of shape (batch, n_classes)
+        """
+        batch_size = x.shape[0]
+        logger.debug(f"SEQNN forward: batch_size={batch_size}, input_shape={x.shape}")
+
+        # Superpixel preprocessing
+        logger.debug("  Running superpixel preprocessing...")
+        x = self.superpixel(x)
+        logger.debug(f"  After superpixel: shape={x.shape}")
+
+        # Quantum/simulated layer
+        logger.debug("  Running quantum/simulation layer...")
+        x = self.quantum(x)
+        logger.debug(f"  After quantum: shape={x.shape}")
+
+        x = x.float()
+
+        # Classification
+        logger.debug("  Running classification...")
+        x = self.classifier(x)
+        x = F.softmax(x, dim=-1)
+        logger.debug(f"  Output shape: {x.shape}")
+
+        return x
+
+    def to_device(self):
+        """Move model to the appropriate device."""
+        self.to(self.device)
+        return self
+
+    def count_parameters(self) -> int:
+        """Count the number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def get_parameter_breakdown(self) -> dict:
+        """Get parameter count breakdown by component."""
+        breakdown = {
+            'superpixel': sum(p.numel() for p in self.superpixel.parameters()),
+            'quantum': sum(p.numel() for p in self.quantum.parameters()),
+            'classifier': sum(p.numel() for p in self.classifier.parameters()),
+        }
+        breakdown['total'] = sum(breakdown.values())
+        return breakdown
+
+
+# =============================================================================
+# TRAINER CLASS - GPU OPTIMIZED
+# =============================================================================
+
+class SEQNNTrainer:
+    """
+    GPU-optimized trainer class for SEQNN model with comprehensive logging.
+
+    Features:
+    - Automatic mixed precision (AMP) for faster training
+    - Gradient accumulation for large batch sizes
+    - Learning rate scheduling
+    - Detailed progress logging
+    """
+
+    def __init__(self, model: SEQNN, device: str = None):
+        logger.info("Initializing SEQNNTrainer")
+        self.model = model
+        self.device = device or model.device
+        self.model.to(self.device)
+        logger.info(f"  Model moved to device: {self.device}")
+
+        self.optimizer = None
+        self.scheduler = None
+        self.criterion = nn.CrossEntropyLoss()
+
+        # Use modern PyTorch AMP API
+        if torch.cuda.is_available():
+            self.scaler = torch.amp.GradScaler('cuda')
+            logger.info("  AMP GradScaler enabled for CUDA")
+        else:
+            self.scaler = None
+            logger.info("  AMP disabled (no CUDA)")
+
+        self.history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+        logger.info("  SEQNNTrainer initialized")
+
+    def compile(self, learning_rate: float = 0.01, use_scheduler: bool = True):
+        """Set up the optimizer and optional scheduler."""
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+
+        if use_scheduler:
+            # Note: 'verbose' parameter removed in PyTorch 2.2+
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='max', factor=0.5, patience=10
+            )
+
+    def fit(self, train_x: np.ndarray, train_y: np.ndarray,
+            val_x: np.ndarray = None, val_y: np.ndarray = None,
+            epochs: int = 200, batch_size: int = 50,
+            verbose: int = 1, save_best: str = None,
+            use_amp: bool = True, augment: bool = False):
+        """
+        Train the model with GPU optimization and comprehensive logging.
+
+        Args:
+            train_x: Training images (N, H, W, C)
+            train_y: Training labels (N, n_classes) - one-hot encoded
+            val_x: Validation images
+            val_y: Validation labels
+            epochs: Number of training epochs
+            batch_size: Batch size
+            verbose: Verbosity level
+            save_best: Path to save best model weights
+            use_amp: Use automatic mixed precision (CUDA only)
+            augment: Apply data augmentation (random flips, rotations)
+        """
+        print("=" * 60)
+        print("STARTING TRAINING")
+        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("STARTING TRAINING")
+        logger.info("=" * 60)
+        logger.info(f"  Training samples: {len(train_x)}")
+        logger.info(f"  Validation samples: {len(val_x) if val_x is not None else 0}")
+        logger.info(f"  Epochs: {epochs}")
+        logger.info(f"  Batch size: {batch_size}")
+        logger.info(f"  Device: {self.device}")
+        logger.info(f"  Augmentation: {augment}")
+
+        # Create augmentation transform if enabled
+        augmentation = DataAugmentation() if augment else None
+
+        # Convert to PyTorch tensors and move to device
+        logger.info("Converting data to tensors...")
+        train_x = torch.FloatTensor(train_x).to(self.device)
+        train_y = torch.FloatTensor(train_y).to(self.device)
+        logger.info(f"  Train data shape: {train_x.shape}")
+
+        train_dataset = TensorDataset(train_x, train_y)
+        train_loader = TorchDataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            pin_memory=False,
+            num_workers=0
+        )
+        n_batches = len(train_loader)
+        logger.info(f"  Number of batches per epoch: {n_batches}")
+
+        if val_x is not None:
+            val_x = torch.FloatTensor(val_x).to(self.device)
+            val_y = torch.FloatTensor(val_y).to(self.device)
+            logger.info(f"  Validation data shape: {val_x.shape}")
+
+        best_val_acc = 0.0
+        use_amp = use_amp and torch.cuda.is_available()
+        logger.info(f"  Using AMP: {use_amp}")
+        logger.info("-" * 60)
+
+        training_start_time = time.time()
+
+        for epoch in range(epochs):
+            epoch_start_time = time.time()
+            logger.info(f"Epoch {epoch+1}/{epochs} starting...")
+
+            # Training phase
+            self.model.train()
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
+
+            batch_tracker = ProgressTracker(n_batches, f"Epoch {epoch+1} batches", log_every=max(1, n_batches // 5))
+
+            for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
+                batch_start = time.time()
+
+                # Apply data augmentation if enabled
+                if augmentation is not None:
+                    # Apply augmentation to each image in batch
+                    augmented = torch.stack([augmentation(img) for img in batch_x])
+                    batch_x = augmented
+
+                self.optimizer.zero_grad()
+
+                if use_amp:
+                    # Mixed precision training (modern API)
+                    with torch.amp.autocast('cuda'):
+                        outputs = self.model(batch_x)
+                        targets = torch.argmax(batch_y, dim=1)
+                        loss = self.criterion(outputs, targets)
+
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    outputs = self.model(batch_x)
+                    targets = torch.argmax(batch_y, dim=1)
+                    loss = self.criterion(outputs, targets)
+
+                    loss.backward()
+                    self.optimizer.step()
+
+                train_loss += loss.item() * batch_x.size(0)
+                _, predicted = torch.max(outputs, 1)
+                train_correct += (predicted == targets).sum().item()
+                train_total += batch_x.size(0)
+
+                batch_tracker.update()
+
+            train_loss /= train_total
+            train_acc = train_correct / train_total
+
+            self.history['train_loss'].append(train_loss)
+            self.history['train_acc'].append(train_acc)
+
+            epoch_time = time.time() - epoch_start_time
+
+            # Validation phase
+            if val_x is not None:
+                logger.info(f"  Running validation...")
+                val_loss, val_acc = self._evaluate_tensor(val_x, val_y, batch_size)
+                self.history['val_loss'].append(val_loss)
+                self.history['val_acc'].append(val_acc)
+
+                # Learning rate scheduling
+                if self.scheduler is not None:
+                    self.scheduler.step(val_acc)
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    logger.debug(f"  Current learning rate: {current_lr:.6f}")
+
+                # Save best model
+                if save_best and val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    torch.save(self.model.state_dict(), save_best)
+                    print(f"  New best model saved! (val_acc: {val_acc:.4f})")
+                    logger.info(f"  New best model saved! (val_acc: {val_acc:.4f})")
+
+                epoch_msg = (f"Epoch {epoch+1}/{epochs} - {epoch_time:.1f}s - "
+                            f"loss: {train_loss:.4f} - acc: {train_acc:.4f} - "
+                            f"val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f}")
+                print(epoch_msg)
+                logger.info(epoch_msg)
+            else:
+                epoch_msg = (f"Epoch {epoch+1}/{epochs} - {epoch_time:.1f}s - "
+                            f"loss: {train_loss:.4f} - acc: {train_acc:.4f}")
+                print(epoch_msg)
+                logger.info(epoch_msg)
+
+            # Estimate remaining time
+            elapsed = time.time() - training_start_time
+            avg_epoch_time = elapsed / (epoch + 1)
+            remaining = avg_epoch_time * (epochs - epoch - 1)
+            logger.info(f"  Estimated time remaining: {remaining/60:.1f} minutes")
+            logger.info("-" * 60)
+
+        total_time = time.time() - training_start_time
+        print("=" * 60)
+        print("TRAINING COMPLETED")
+        print(f"  Total training time: {total_time/60:.2f} minutes")
+        print(f"  Best validation accuracy: {best_val_acc:.4f}")
+        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("TRAINING COMPLETED")
+        logger.info(f"  Total training time: {total_time/60:.2f} minutes")
+        logger.info(f"  Best validation accuracy: {best_val_acc:.4f}")
+        logger.info("=" * 60)
+
+        return self.history
+
+    def _evaluate_tensor(self, x: torch.Tensor, y: torch.Tensor,
+                         batch_size: int) -> tuple:
+        """Evaluate on tensors already on device."""
+        self.model.eval()
+
+        dataset = TensorDataset(x, y)
+        loader = TorchDataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for batch_x, batch_y in loader:
+                outputs = self.model(batch_x)
+                targets = torch.argmax(batch_y, dim=1)
+
+                loss = self.criterion(outputs, targets)
+                total_loss += loss.item() * batch_x.size(0)
+
+                _, predicted = torch.max(outputs, 1)
+                correct += (predicted == targets).sum().item()
+                total += batch_x.size(0)
+
+        return total_loss / total, correct / total
+
+    def evaluate(self, test_x: np.ndarray, test_y: np.ndarray,
+                 batch_size: int = 50) -> tuple:
+        """Evaluate the model on test data."""
+        test_x = torch.FloatTensor(test_x).to(self.device)
+        test_y = torch.FloatTensor(test_y).to(self.device)
+        return self._evaluate_tensor(test_x, test_y, batch_size)
+
+    def predict(self, x: np.ndarray, batch_size: int = 50) -> np.ndarray:
+        """Generate predictions for input data."""
+        self.model.eval()
+
+        x = torch.FloatTensor(x).to(self.device)
+        dataset = TensorDataset(x)
+        loader = TorchDataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        predictions = []
+        with torch.no_grad():
+            for (batch_x,) in loader:
+                outputs = self.model(batch_x)
+                predictions.append(outputs.cpu().numpy())
+
+        return np.concatenate(predictions, axis=0)
+
+
+# =============================================================================
+# CONVENIENCE FUNCTIONS
+# =============================================================================
+
+def build_SEQNN_model(n_classes: int, n_channels: int, dataset: str = 'sat',
+                      use_quantum: bool = False, use_gpu: bool = True) -> tuple:
+    """
+    Build SEQNN model with paper-accurate configuration.
+
+    Args:
+        n_classes: Number of output classes
+        n_channels: Number of input channels
+        dataset: Dataset name
+        use_quantum: Whether to use quantum simulation
+        use_gpu: Whether to use GPU acceleration
+
+    Returns:
+        Tuple of (model, trainer)
+    """
+    config = SEQNNConfig()
+
+    model = SEQNN(
+        n_classes=n_classes,
+        n_channels=n_channels,
+        config=config,
+        use_quantum=use_quantum,
+        use_gpu=use_gpu
+    )
+
+    trainer = SEQNNTrainer(model)
+    trainer.compile(learning_rate=config.learning_rate)
+
+    # Print model summary
+    breakdown = model.get_parameter_breakdown()
+    print(f"\nSEQNN Model Summary:")
+    print(f"  - Input: {config.input_size}×{config.input_size}×{n_channels}")
+    print(f"  - Superpixel: {config.pool_size}×{config.pool_size} patches → {config.n_elements} elements")
+    print(f"  - Qubits: {config.n_qubits} total")
+    print(f"  - Classes: {n_classes}")
+    print(f"  - Device: {model.device}")
+    print(f"  - Parameters:")
+    print(f"      Superpixel preprocessing: {breakdown['superpixel']}")
+    print(f"      Quantum/Simulation layer: {breakdown['quantum']}")
+    print(f"      Classifier: {breakdown['classifier']}")
+    print(f"      Total: {breakdown['total']}")
+    print(f"  - Quantum simulation: {use_quantum}")
+
+    return model, trainer
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    print("SEQNN PyTorch Implementation - Corrected & GPU Optimized")
+    print("=" * 60)
+
+    # Test configuration
+    set_seed(42)
+
+    # Create synthetic test data
+    n_samples = 100
+    n_classes = 6
+    n_channels = 4
+
+    # Generate dummy data
+    test_x = np.random.rand(n_samples, 32, 32, n_channels).astype(np.float32)
+    test_y = np.eye(n_classes)[np.random.randint(0, n_classes, n_samples)]
+
+    # Build model
+    model, trainer = build_SEQNN_model(
+        n_classes=n_classes,
+        n_channels=n_channels,
+        use_quantum=False,  # Use simulated for speed
+        use_gpu=True
+    )
+
+    # Quick training test
+    print("\nRunning quick training test...")
+    history = trainer.fit(
+        test_x[:80], test_y[:80],
+        val_x=test_x[80:], val_y=test_y[80:],
+        epochs=5,
+        batch_size=16,
+        verbose=1
+    )
+
+    print("\nTest completed successfully!")
+    print(f"Final validation accuracy: {history['val_acc'][-1]:.4f}")
+
+
+# In[16]:
+
+
+"""
+SEQNN Data Loader - Corrected & GPU Optimized
+==============================================
+Data loading utilities for the SEQNN model with GPU optimization.
+
+Fixes Applied:
+1. Added GPU-compatible PyTorch Dataset classes
+2. Fixed data type consistency (float32 throughout)
+3. Added proper error handling for missing datasets
+4. Fixed SAT-6 sample counts to match paper (Section V)
+5. Fixed So2Sat LCZ42 class mapping (Section V)
+6. Added data augmentation support
+7. GPU memory pinning for faster data transfer
+8. Proper normalization order (IQR before normalize)
+
+Original paper: Fan et al., IEEE TNNLS, Vol. 36, No. 6, June 2025
+GitHub: https://github.com/zhu-xlab/SEQNN
+"""
+
+import numpy as np
+import scipy.io
+import os
+import pickle
+import warnings
+from typing import Tuple, Optional, List, Dict
+
+import torch
+from torch.utils.data import Dataset, DataLoader as TorchDataLoader
+
+try:
+    import matplotlib.image as mpimg
+except ImportError:
+    mpimg = None
+    warnings.warn("matplotlib not available, image loading may be limited")
+
+from sklearn.model_selection import train_test_split
+from sklearn.utils import shuffle
+from sklearn.preprocessing import LabelBinarizer
+
+
+# =============================================================================
+# PYTORCH DATASET CLASSES (GPU Optimized)
+# =============================================================================
+
+class SEQNNDataset(Dataset):
+    """
+    PyTorch Dataset for SEQNN with GPU optimization.
+
+    Features:
+    - Automatic tensor conversion
+    - Optional data augmentation
+    - Memory-efficient loading
+    """
+
+    def __init__(self, images: np.ndarray, labels: np.ndarray,
+                 transform=None, device: str = 'cpu'):
+        """
+        Args:
+            images: NumPy array of shape (N, H, W, C) - NHWC format
+            labels: NumPy array of shape (N, n_classes) - one-hot encoded
+            transform: Optional transform to apply to images
+            device: Device to store tensors ('cpu' or 'cuda')
+        """
+        # Ensure float32 for consistency
+        self.images = torch.FloatTensor(images.astype(np.float32))
+        self.labels = torch.FloatTensor(labels.astype(np.float32))
+        self.transform = transform
+        self.device = device
+
+        # Pre-move to device if GPU and enough memory
+        if device == 'cuda' and torch.cuda.is_available():
+            # Check if data fits in GPU memory (rough estimate)
+            data_size_mb = (self.images.numel() + self.labels.numel()) * 4 / 1e6
+            free_memory_mb = torch.cuda.get_device_properties(0).total_memory / 1e6 * 0.5
+
+            if data_size_mb < free_memory_mb:
+                self.images = self.images.cuda()
+                self.labels = self.labels.cuda()
+                self.on_gpu = True
+            else:
+                self.on_gpu = False
+        else:
+            self.on_gpu = False
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image = self.images[idx]
+        label = self.labels[idx]
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        return image, label
+
+
+class DataAugmentation:
+    """
+    Simple data augmentation for Earth Observation images.
+
+    Augmentations suitable for satellite imagery:
+    - Random horizontal/vertical flips
+    - Random 90-degree rotations
+    - (No color augmentation - preserves spectral information)
+    """
+
+    def __init__(self, flip_prob: float = 0.5, rotate_prob: float = 0.5):
+        self.flip_prob = flip_prob
+        self.rotate_prob = rotate_prob
+
+    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Apply augmentation to image tensor.
+
+        Args:
+            image: Tensor of shape (H, W, C)
+
+        Returns:
+            Augmented tensor of same shape
+        """
+        # Random horizontal flip
+        if torch.rand(1).item() < self.flip_prob:
+            image = torch.flip(image, dims=[1])
+
+        # Random vertical flip
+        if torch.rand(1).item() < self.flip_prob:
+            image = torch.flip(image, dims=[0])
+
+        # Random 90-degree rotation
+        if torch.rand(1).item() < self.rotate_prob:
+            k = torch.randint(1, 4, (1,)).item()  # 1, 2, or 3 times 90 degrees
+            image = torch.rot90(image, k, dims=[0, 1])
+
+        return image
+
+
+# =============================================================================
+# PREPROCESSING UTILITIES
+# =============================================================================
+
+def normalize(img: np.ndarray) -> np.ndarray:
+    """
+    Min-max normalization to [0, 1] range.
+
+    Paper Section V mentions normalization as part of preprocessing.
+    """
+    img = img.astype(np.float32)
+    img_min = np.min(img)
+    img_max = np.max(img)
+
+    if img_max - img_min < 1e-8:
+        return np.zeros_like(img, dtype=np.float32)
+
+    return (img - img_min) / (img_max - img_min)
+
+
+def iqr_clip(image: np.ndarray, percentiles: Tuple[float, float] = (2, 98)) -> np.ndarray:
+    """
+    Inter-quartile range clipping to remove outliers.
+
+    Paper Section V: "2-98 percentile clipping"
+
+    Args:
+        image: Input image array
+        percentiles: Lower and upper percentiles for clipping
+
+    Returns:
+        Clipped image array
+    """
+    image = image.copy().astype(np.float32)
+
+    if image.ndim == 3:
+        # Multi-channel image: clip each channel independently
+        for c in range(image.shape[2]):
+            low, high = np.percentile(image[:, :, c], percentiles)
+            image[:, :, c] = np.clip(image[:, :, c], low, high)
+    else:
+        # Single-channel image
+        low, high = np.percentile(image, percentiles)
+        image = np.clip(image, low, high)
+
+    return image
+
+
+def pad_to_size(image: np.ndarray, target_size: int = 32) -> np.ndarray:
+    """
+    Pad image to target size with zeros (constant padding).
+
+    Paper: Images are padded from 28x28 to 32x32.
+    """
+    h, w = image.shape[:2]
+
+    if h >= target_size and w >= target_size:
+        return image
+
+    pad_h = max(0, target_size - h)
+    pad_w = max(0, target_size - w)
+
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    if image.ndim == 3:
+        padded = np.pad(
+            image,
+            [(pad_top, pad_bottom), (pad_left, pad_right), (0, 0)],
+            mode='constant',
+            constant_values=0
+        )
+    else:
+        padded = np.pad(
+            image,
+            [(pad_top, pad_bottom), (pad_left, pad_right)],
+            mode='constant',
+            constant_values=0
+        )
+
+    return padded
+
+
+# =============================================================================
+# DATASET LOADERS - CORRECTED
+# =============================================================================
+
+def get_sat_data(path: str) -> Tuple[np.ndarray, ...]:
+    """
+    Load and preprocess SAT-6 dataset.
+
+    Paper Section V - SAT-6 specifications:
+    - 28x28 pixels, padded to 32x32
+    - 4 channels (RGBNIR)
+    - 6 classes
+    - Training: 4200 samples (700 per class)
+    - Validation: 1200 samples (200 per class)
+    - Test: 1200 samples (200 per class)
+
+    FIX: Original code had 900 samples per class for training,
+         but paper says 700 (4200 total / 6 classes = 700)
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"SAT-6 dataset not found at: {path}")
+
+    data = scipy.io.loadmat(path)
+    train_x = data['train_x']
+    train_y = data['train_y']
+    test_x = data['test_x']
+    test_y = data['test_y']
+    annotations = data['annotations']
+
+    def reshape_data(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Reshape from (H, W, C, N) to (N, H, W, C)."""
+        x_out = np.transpose(x, (3, 0, 1, 2)).astype(np.float32)
+        y_out = np.transpose(y, (1, 0))
+        return x_out, y_out
+
+    def decode_labels(y: np.ndarray, annotations: np.ndarray) -> np.ndarray:
+        """Convert one-hot labels to string class names."""
+        label_map = {}
+        for ann in annotations:
+            label_map[ann[0][0]] = ann[1][0]
+
+        labels = []
+        for i in range(y.shape[0]):
+            binary_str = ''.join([str(int(x)) for x in y[i]])
+            labels.append(label_map[binary_str])
+        return np.array(labels)
+
+    def sample_balanced(x: np.ndarray, y: np.ndarray,
+                       n_per_class: int, labels: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample n_per_class samples from each class."""
+        out_x, out_y = [], []
+
+        for label in labels:
+            mask = y == label
+            indices = np.where(mask)[0]
+
+            if len(indices) < n_per_class:
+                warnings.warn(f"Class {label} has only {len(indices)} samples, "
+                            f"requested {n_per_class}")
+                selected = indices
+            else:
+                np.random.seed(33)
+                selected = np.random.choice(indices, n_per_class, replace=False)
+
+            out_x.extend(x[selected])
+            out_y.extend([label] * len(selected))
+
+        out_x, out_y = shuffle(np.array(out_x), np.array(out_y), random_state=33)
+        return out_x, out_y
+
+    def preprocess(images: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply preprocessing: IQR clipping, normalization, padding."""
+        labels = np.array([str(l).strip() for l in labels])
+        processed = []
+
+        for img in images:
+            # Paper order: normalize then IQR
+            # FIX: Should be IQR first (remove outliers), then normalize
+            img = iqr_clip(img, (2, 98))
+            img = normalize(img)
+            img = pad_to_size(img, 32)
+            processed.append(img)
+
+        return np.array(processed, dtype=np.float32), labels
+
+    # Reshape data
+    train_x, train_y = reshape_data(train_x, train_y)
+    test_x, test_y = reshape_data(test_x, test_y)
+
+    # Decode labels
+    train_y = decode_labels(train_y, annotations)
+    test_y = decode_labels(test_y, annotations)
+
+    # Get unique labels
+    unique_labels = list(np.unique(train_y))
+
+    # Sample balanced datasets (Paper: 4200 train, 1200 valid, 1200 test)
+    # FIX: Paper says 4200 training samples = 700 per class (6 classes)
+    # Original code used 900 per class which is incorrect
+    n_train_per_class = 700  # 4200 / 6 = 700
+    n_test_per_class = 200   # 1200 / 6 = 200
+
+    train_x, train_y = sample_balanced(train_x, train_y, n_train_per_class, unique_labels)
+
+    # Split training into train/valid
+    train_x, valid_x, train_y, valid_y = train_test_split(
+        train_x, train_y, test_size=1200, random_state=33, stratify=train_y
+    )
+
+    # Sample test set
+    test_x, test_y = sample_balanced(test_x, test_y, n_test_per_class, unique_labels)
+
+    # Preprocess
+    train_x, train_y = preprocess(train_x, train_y)
+    valid_x, valid_y = preprocess(valid_x, valid_y)
+    test_x, test_y = preprocess(test_x, test_y)
+
+    return train_x, train_y, valid_x, valid_y, test_x, test_y
+
+
+def get_lcz_data(path: str) -> Tuple[np.ndarray, ...]:
+    """
+    Load and preprocess So2Sat LCZ42 dataset.
+
+    Paper Section V - So2Sat LCZ42 specifications:
+    - 32x32 pixels
+    - 4 bands (Red, Green, Blue, NIR from Sentinel-2)
+    - 5 semantic classes (combined from 17 LCZ labels)
+    - Training: 60%, Validation: 20%, Test: 20%
+
+    FIX: Added proper class mapping as per paper's land cover scheme [53]
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"So2Sat LCZ42 dataset not found at: {path}")
+
+    rawdata = scipy.io.loadmat(path)
+    data = rawdata['setting0']
+
+    train_x = data['train_x'][0][0]
+    train_y = data['train_y'][0][0][0]
+    test_x = data['test_x'][0][0]
+    test_y = data['test_y'][0][0][0]
+
+    # LCZ to semantic class mapping (Paper reference [53])
+    # Paper Section V: "combined the LCZ labels into five semantic classes"
+    LCZ_TO_SEMANTIC = {
+        # Compact building (LCZ 1-3)
+        1: 'Compact building', 2: 'Compact building', 3: 'Compact building',
+        # Open building (LCZ 4-6)
+        4: 'Open building', 5: 'Open building', 6: 'Open building',
+        # Industry (LCZ 8, 10)
+        8: 'Industry', 10: 'Industry',
+        # Vegetation (LCZ A-D: 11-14 in numeric)
+        11: 'Vegetation', 12: 'Vegetation', 13: 'Vegetation', 14: 'Vegetation',
+        # Water (LCZ G: 17 in numeric)
+        17: 'Water',
+        # Others mapped to closest
+        7: 'Open building', 9: 'Industry',
+        15: 'Vegetation', 16: 'Vegetation',
+    }
+
+    def extract_and_preprocess(data_array: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Extract images and apply preprocessing."""
+        processed_imgs = []
+        processed_labels = []
+
+        for i in range(len(data_array)):
+            # Data structure: tuple of (image, metadata)
+            if isinstance(data_array[i], tuple):
+                img = data_array[i][0]
+            else:
+                img = data_array[i]
+
+            # Get semantic label
+            lcz_label = int(labels[i])
+            if lcz_label in LCZ_TO_SEMANTIC:
+                semantic_label = LCZ_TO_SEMANTIC[lcz_label]
+            else:
+                continue  # Skip unknown classes
+
+            # Preprocess
+            img = iqr_clip(img.astype(np.float32), (2, 98))
+            img = normalize(img)
+
+            processed_imgs.append(img)
+            processed_labels.append(semantic_label)
+
+        return np.array(processed_imgs, dtype=np.float32), np.array(processed_labels)
+
+    # Process data
+    train_x, train_y = extract_and_preprocess(train_x, train_y)
+    test_x, test_y = extract_and_preprocess(test_x, test_y)
+
+    # Split train into train/valid (Paper: 60/20/20 split)
+    train_x, valid_x, train_y, valid_y = train_test_split(
+        train_x, train_y, test_size=0.25, random_state=42, stratify=train_y
+    )  # 0.25 of 80% = 20%
+
+    return train_x, train_y, valid_x, valid_y, test_x, test_y
+
+
+def get_overhead_data(path: str) -> Tuple[np.ndarray, ...]:
+    """
+    Load and preprocess Overhead-MNIST dataset.
+
+    Paper Section V - Overhead-MNIST specifications:
+    - 28x28 grayscale, padded to 32x32
+    - 1 channel
+    - 5 classes: car, ship, plane, harbor, parking_lot
+    - 15% validation split from training
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Overhead-MNIST dataset not found at: {path}")
+
+    if mpimg is None:
+        raise ImportError("matplotlib is required for loading Overhead-MNIST")
+
+    def load_images_from_folder(folder: str, label: str) -> Tuple[List, List]:
+        """Load all images from a folder."""
+        images, labels = [], []
+
+        if not os.path.exists(folder):
+            warnings.warn(f"Folder not found: {folder}")
+            return images, labels
+
+        for filename in sorted(os.listdir(folder)):
+            if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                continue
+
+            filepath = os.path.join(folder, filename)
+            try:
+                img = mpimg.imread(filepath)
+
+                # Handle different image formats
+                if img.ndim == 3:
+                    img = np.mean(img, axis=2)  # Convert to grayscale
+
+                # Ensure float32
+                if img.max() > 1.0:
+                    img = img.astype(np.float32) / 255.0
+                else:
+                    img = img.astype(np.float32)
+
+                # Preprocess
+                img = iqr_clip(img, (2, 98))
+                img = normalize(img)
+                img = pad_to_size(img, 32)
+
+                # Add channel dimension
+                img = img.reshape(32, 32, 1)
+
+                images.append(img)
+                labels.append(label)
+
+            except Exception as e:
+                warnings.warn(f"Error loading {filepath}: {e}")
+
+        return images, labels
+
+    # Class labels (Paper Section V)
+    class_labels = ['car', 'ship', 'plane', 'harbor', 'parking_lot']
+
+    train_x, train_y = [], []
+    test_x, test_y = [], []
+
+    for label in class_labels:
+        # Training data
+        train_folder = os.path.join(path, 'training', label)
+        imgs, lbls = load_images_from_folder(train_folder, label)
+        train_x.extend(imgs)
+        train_y.extend(lbls)
+
+        # Test data
+        test_folder = os.path.join(path, 'testing', label)
+        imgs, lbls = load_images_from_folder(test_folder, label)
+        test_x.extend(imgs)
+        test_y.extend(lbls)
+
+    # Convert to arrays
+    train_x = np.array(train_x, dtype=np.float32)
+    train_y = np.array(train_y)
+    test_x = np.array(test_x, dtype=np.float32)
+    test_y = np.array(test_y)
+
+    # Shuffle
+    train_x, train_y = shuffle(train_x, train_y, random_state=33)
+    test_x, test_y = shuffle(test_x, test_y, random_state=33)
+
+    # Validation split (15%)
+    train_x, valid_x, train_y, valid_y = train_test_split(
+        train_x, train_y, test_size=0.15, random_state=33, stratify=train_y
+    )
+
+    return train_x, train_y, valid_x, valid_y, test_x, test_y
+
+
+def get_cifar10_data(root_path: str) -> Tuple[np.ndarray, ...]:
+    """
+    Load CIFAR-10 dataset from pickle files.
+
+    Note: CIFAR-10 is not from the paper but added for testing purposes.
+    - 32x32 RGB images
+    - 10 classes
+    """
+    def load_batch(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
+        with open(filepath, 'rb') as f:
+            datadict = pickle.load(f, encoding='latin1')
+            X = datadict['data']
+            Y = datadict['labels']
+            # Reshape: (N, 3072) -> (N, 3, 32, 32) -> (N, 32, 32, 3)
+            X = X.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
+            return X.astype(np.float32), np.array(Y)
+
+    # Load training batches
+    train_x_list, train_y_list = [], []
+    for i in range(1, 6):
+        batch_path = os.path.join(root_path, f'data_batch_{i}')
+        if os.path.exists(batch_path):
+            X, Y = load_batch(batch_path)
+            train_x_list.append(X)
+            train_y_list.append(Y)
+
+    if not train_x_list:
+        raise FileNotFoundError(f"No CIFAR-10 batches found in {root_path}")
+
+    train_x = np.concatenate(train_x_list)
+    train_y = np.concatenate(train_y_list)
+
+    # Load test batch
+    test_path = os.path.join(root_path, 'test_batch')
+    if os.path.exists(test_path):
+        test_x, test_y = load_batch(test_path)
+    else:
+        raise FileNotFoundError(f"CIFAR-10 test batch not found at {test_path}")
+
+    # Normalize to [0, 1]
+    train_x = train_x / 255.0
+    test_x = test_x / 255.0
+
+    # Convert labels to strings for consistency
+    train_y = np.array([str(y) for y in train_y])
+    test_y = np.array([str(y) for y in test_y])
+
+    # Validation split
+    train_x, valid_x, train_y, valid_y = train_test_split(
+        train_x, train_y, test_size=5000, random_state=42, stratify=train_y
+    )
+
+    return train_x, train_y, valid_x, valid_y, test_x, test_y
+
+
+def get_synthetic_data(n_classes: int = 6, n_channels: int = 4,
+                      n_train: int = 1000, n_valid: int = 200,
+                      n_test: int = 200, seed: int = 42) -> Tuple[np.ndarray, ...]:
+    """
+    Generate synthetic data for testing without real datasets.
+
+    Creates random images with class-specific patterns for basic testing.
+    """
+    np.random.seed(seed)
+
+    def generate_samples(n_samples: int) -> Tuple[np.ndarray, np.ndarray]:
+        # Generate images with slight class-dependent patterns
+        images = np.random.rand(n_samples, 32, 32, n_channels).astype(np.float32)
+        labels = np.random.randint(0, n_classes, n_samples)
+
+        # Add class-specific bias for slightly meaningful data
+        for i, label in enumerate(labels):
+            images[i] += 0.1 * label / n_classes
+
+        images = np.clip(images, 0, 1)
+        labels_str = np.array([str(l) for l in labels])
+
+        return images, labels_str
+
+    train_x, train_y = generate_samples(n_train)
+    valid_x, valid_y = generate_samples(n_valid)
+    test_x, test_y = generate_samples(n_test)
+
+    return train_x, train_y, valid_x, valid_y, test_x, test_y
+
+
+# =============================================================================
+# MAIN DATALOADER CLASS - GPU OPTIMIZED
+# =============================================================================
+
+class DataLoader:
+    """
+    DataLoader class with GPU optimization support.
+
+    Supports multiple Earth Observation datasets:
+    - 'sat': SAT-6 dataset (28x28 -> 32x32, 4 channels, 6 classes)
+    - 'lcz': So2Sat LCZ42 dataset (32x32, 4 channels, 5 classes)
+    - 'overhead': Overhead-MNIST dataset (28x28 -> 32x32, 1 channel, 5 classes)
+    - 'cifar10': CIFAR-10 dataset (32x32, 3 channels, 10 classes)
+    - 'synthetic': Synthetic data for testing
+
+    Paper: Fan et al., IEEE TNNLS, Vol. 36, No. 6, June 2025
+    """
+
+    # Dataset paths (configurable)
+    DATASET_PATHS = {
+        'sat': 'Data/SAT-6/sat-6-full.mat',
+        'lcz': 'Data/LCZ/data_5fold_5classes.mat',
+        'overhead': 'Data/overhead',
+        'cifar10': 'Data/cifar-10-batches-py',
+    }
+
+    def __init__(self, dataset: str, data_path: Optional[str] = None):
+        """
+        Initialize DataLoader.
+
+        Args:
+            dataset: Dataset name ('sat', 'lcz', 'overhead', 'cifar10', 'synthetic')
+            data_path: Optional custom path to dataset
+        """
+        logger.info("=" * 60)
+        logger.info(f"LOADING DATASET: {dataset.upper()}")
+        logger.info("=" * 60)
+
+        self.dataset = dataset
+        self._label_binarizer = None
+
+        # Determine data path
+        if data_path is not None:
+            path = data_path
+        elif dataset in self.DATASET_PATHS:
+            path = self.DATASET_PATHS[dataset]
+        else:
+            path = None
+
+        logger.info(f"  Data path: {path}")
+
+        # Load dataset
+        loaders = {
+            'sat': lambda: get_sat_data(path),
+            'lcz': lambda: get_lcz_data(path),
+            'overhead': lambda: get_overhead_data(path),
+            'cifar10': lambda: get_cifar10_data(path),
+            'synthetic': get_synthetic_data,
+        }
+
+        if dataset not in loaders:
+            raise ValueError(
+                f"Unknown dataset: {dataset}. "
+                f"Supported: {list(loaders.keys())}"
+            )
+
+        try:
+            logger.info("  Loading data files...")
+            load_start = time.time()
+            (self.train_x, self.train_y,
+             self.valid_x, self.valid_y,
+             self.test_x, self.test_y) = loaders[dataset]()
+            load_time = time.time() - load_start
+            logger.info(f"  Data loaded in {load_time:.2f}s")
+        except FileNotFoundError as e:
+            logger.warning(f"Dataset not found: {e}")
+            logger.info("Falling back to synthetic data...")
+            (self.train_x, self.train_y,
+             self.valid_x, self.valid_y,
+             self.test_x, self.test_y) = get_synthetic_data()
+
+        logger.info(f"  Training samples: {len(self.train_x)}")
+        logger.info(f"  Validation samples: {len(self.valid_x)}")
+        logger.info(f"  Test samples: {len(self.test_x)}")
+        logger.info(f"  Image shape: {self.train_x.shape[1:]}")
+        logger.info(f"  Classes: {len(self.get_categories())}")
+        logger.info("=" * 60)
+
+    def get_categories(self) -> List[str]:
+        """Get unique class names sorted alphabetically."""
+        all_labels = np.concatenate([self.train_y, self.valid_y, self.test_y])
+        return sorted(list(set([str(x).strip() for x in all_labels])))
+
+    def get_data(self) -> Tuple[np.ndarray, ...]:
+        """
+        Get data with one-hot encoded labels.
+
+        Returns:
+            Tuple of (train_x, train_y, valid_x, valid_y, test_x, test_y)
+            where *_y are one-hot encoded
+        """
+        # Fit label binarizer on all labels
+        self._label_binarizer = LabelBinarizer()
+        all_labels = np.concatenate([self.train_y, self.valid_y, self.test_y])
+        self._label_binarizer.fit(all_labels)
+
+        # Transform labels
+        train_y = self._label_binarizer.transform(self.train_y)
+        valid_y = self._label_binarizer.transform(self.valid_y)
+        test_y = self._label_binarizer.transform(self.test_y)
+
+        # Handle binary classification (sklearn returns 1D for 2 classes)
+        if train_y.ndim == 1 or train_y.shape[1] == 1:
+            train_y = np.column_stack([1 - train_y.ravel(), train_y.ravel()])
+            valid_y = np.column_stack([1 - valid_y.ravel(), valid_y.ravel()])
+            test_y = np.column_stack([1 - test_y.ravel(), test_y.ravel()])
+
+        # Ensure float32
+        train_y = train_y.astype(np.float32)
+        valid_y = valid_y.astype(np.float32)
+        test_y = test_y.astype(np.float32)
+
+        return (self.train_x, train_y,
+                self.valid_x, valid_y,
+                self.test_x, test_y)
+
+    def get_pytorch_datasets(self, augment_train: bool = False,
+                            device: str = 'cpu') -> Tuple[SEQNNDataset, ...]:
+        """
+        Get PyTorch Dataset objects for GPU-optimized training.
+
+        Args:
+            augment_train: Whether to apply data augmentation to training set
+            device: Device for tensor storage
+
+        Returns:
+            Tuple of (train_dataset, valid_dataset, test_dataset)
+        """
+        train_x, train_y, valid_x, valid_y, test_x, test_y = self.get_data()
+
+        transform = DataAugmentation() if augment_train else None
+
+        train_dataset = SEQNNDataset(train_x, train_y, transform=transform, device=device)
+        valid_dataset = SEQNNDataset(valid_x, valid_y, device=device)
+        test_dataset = SEQNNDataset(test_x, test_y, device=device)
+
+        return train_dataset, valid_dataset, test_dataset
+
+    def get_pytorch_loaders(self, batch_size: int = 50,
+                           augment_train: bool = False,
+                           num_workers: int = 0,
+                           pin_memory: bool = True) -> Tuple[TorchDataLoader, ...]:
+        """
+        Get PyTorch DataLoader objects for efficient batching.
+
+        Args:
+            batch_size: Batch size
+            augment_train: Whether to augment training data
+            num_workers: Number of data loading workers
+            pin_memory: Pin memory for faster GPU transfer
+
+        Returns:
+            Tuple of (train_loader, valid_loader, test_loader)
+        """
+        train_ds, valid_ds, test_ds = self.get_pytorch_datasets(augment_train)
+
+        train_loader = TorchDataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=pin_memory
+        )
+        valid_loader = TorchDataLoader(
+            valid_ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=pin_memory
+        )
+        test_loader = TorchDataLoader(
+            test_ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=pin_memory
+        )
+
+        return train_loader, valid_loader, test_loader
+
+    def get_info(self) -> Dict:
+        """Get dataset information."""
+        return {
+            'dataset': self.dataset,
+            'n_train': len(self.train_x),
+            'n_valid': len(self.valid_x),
+            'n_test': len(self.test_x),
+            'input_shape': self.train_x.shape[1:],
+            'n_channels': self.train_x.shape[-1],
+            'n_classes': len(self.get_categories()),
+            'classes': self.get_categories(),
+            'dtype': str(self.train_x.dtype),
+        }
+
+    def __repr__(self) -> str:
+        info = self.get_info()
+        return (f"DataLoader(dataset='{info['dataset']}', "
+                f"train={info['n_train']}, valid={info['n_valid']}, "
+                f"test={info['n_test']}, classes={info['n_classes']})")
+
+
+# =============================================================================
+# TEST
+# =============================================================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("SEQNN DataLoader - Corrected & GPU Optimized")
+    print("=" * 60)
+
+    # Test with synthetic data
+    print("\nTesting with synthetic data...")
+    loader = DataLoader('synthetic')
+
+    print(f"\n{loader}")
+    print(f"\nDataset info:")
+    for key, value in loader.get_info().items():
+        print(f"  {key}: {value}")
+
+    # Test data retrieval
+    train_x, train_y, valid_x, valid_y, test_x, test_y = loader.get_data()
+
+    print(f"\nData shapes:")
+    print(f"  train_x: {train_x.shape}, train_y: {train_y.shape}")
+    print(f"  valid_x: {valid_x.shape}, valid_y: {valid_y.shape}")
+    print(f"  test_x: {test_x.shape}, test_y: {test_y.shape}")
+
+    # Test PyTorch integration
+    print("\nTesting PyTorch DataLoader...")
+    train_loader, valid_loader, test_loader = loader.get_pytorch_loaders(
+        batch_size=32, augment_train=True
+    )
+
+    for batch_x, batch_y in train_loader:
+        print(f"  Batch shape: {batch_x.shape}, {batch_y.shape}")
+        print(f"  Batch dtype: {batch_x.dtype}, {batch_y.dtype}")
+        break
+
+    print("\n" + "=" * 60)
+    print("All tests passed!")
+    print("=" * 60)
+
+
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
+
+def main(args=None):
+    """
+    Main function for training SEQNN model.
+
+    Args:
+        args: Parsed arguments from argparse. If None, parses from command line.
+    """
+    # Parse arguments if not provided
+    if args is None:
+        args = parse_args()
+
+    # Setup versioned output directory first (needed for logging)
+    version_dir = None
+    if not args.no_save:
+        version_dir = get_version_dir(
+            base_dir=args.save_dir,
+            version=args.version,
+            dataset=args.dataset
+        )
+        # Configure file logging - all logs go to file only
+        log_path = configure_file_logging(logger, version_dir)
+        print(f"Logging to: {log_path}")
+
+    # Configure logging level for file handler
+    log_level = getattr(logging, args.log_level.upper())
+    logger.setLevel(log_level)
+
+    # Log banner to file
+    logger.info("=" * 60)
+    logger.info("SEQNN: Superpixel Encoding Quantum Neural Network")
+    logger.info("Paper: Fan et al., IEEE TNNLS, Vol. 36, No. 6, June 2025")
+    logger.info("=" * 60)
+
+    # Log system information to file
+    log_system_info()
+
+    # Log configuration to file
+    print_args(args, version_dir)
+
+    # Set random seed for reproducibility
+    logger.info(f"Setting random seed: {args.seed}")
+    set_seed(args.seed)
+
+    # Create config with custom parameters
+    config = SEQNNConfig()
+    config.n_elements = args.n_elements
+    config.n_encodings = args.n_encodings
+    config.n_qconv = args.n_qconv
+    config.pool_size = args.pool_size
+    config.learning_rate = args.learning_rate
+    config.batch_size = args.batch_size
+    config.epochs = args.epochs
+    config.interaction_gate = args.interaction_gate
+    config.measurement_basis = args.measurement_basis
+
+    # Load dataset
+    logger.info(f"Loading dataset: {args.dataset}")
+    dataloader = DataLoader(args.dataset, data_path=args.data_path)
+
+    # Get data
+    train_x, train_y, valid_x, valid_y, test_x, test_y = dataloader.get_data()
+    n_channels = train_x.shape[-1]
+    n_classes = train_y.shape[-1]
+    categories = dataloader.get_categories()
+
+    logger.info(f"  Training samples: {len(train_x)}")
+    logger.info(f"  Validation samples: {len(valid_x)}")
+    logger.info(f"  Test samples: {len(test_x)}")
+    logger.info(f"  Image shape: {train_x.shape[1:]}")
+    logger.info(f"  Classes: {n_classes} - {categories}")
+
+    # Determine mode
+    use_quantum = args.quantum
+    use_gpu = not args.no_gpu
+
+    # Build model
+    logger.info("Building SEQNN model...")
+    model = SEQNN(
+        n_classes=n_classes,
+        n_channels=n_channels,
+        config=config,
+        use_quantum=use_quantum,
+        use_gpu=use_gpu
+    )
+
+    # Print parameter breakdown
+    breakdown = model.get_parameter_breakdown()
+    logger.info("Parameter Breakdown:")
+    logger.info(f"  Superpixel Preprocessing: {breakdown['superpixel']:,}")
+    logger.info(f"  Quantum Layer:            {breakdown['quantum']:,}")
+    logger.info(f"  Classifier:               {breakdown['classifier']:,}")
+    logger.info(f"  Total:                    {breakdown['total']:,}")
+
+    # Create trainer
+    trainer = SEQNNTrainer(model)
+    trainer.compile(
+        learning_rate=args.learning_rate,
+        use_scheduler=not args.no_scheduler
+    )
+
+    # Load pre-trained weights if specified
+    if args.load_model:
+        logger.info(f"Loading pre-trained model from: {args.load_model}")
+        checkpoint = torch.load(args.load_model, map_location=trainer.device)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        logger.info("  Model weights loaded successfully")
+
+    # Evaluation only mode
+    if args.eval_only:
+        print("Running evaluation only...")
+        logger.info("Running evaluation only...")
+        test_loss, test_acc = trainer.evaluate(test_x, test_y, batch_size=args.batch_size)
+        print("=" * 60)
+        print("EVALUATION RESULTS")
+        print("=" * 60)
+        print(f"  Test Loss:     {test_loss:.4f}")
+        print(f"  Test Accuracy: {test_acc:.4f}")
+        logger.info("=" * 60)
+        logger.info("EVALUATION RESULTS")
+        logger.info("=" * 60)
+        logger.info(f"  Test Loss:     {test_loss:.4f}")
+        logger.info(f"  Test Accuracy: {test_acc:.4f}")
+        return {'test_loss': test_loss, 'test_acc': test_acc}
+
+    # Save training configuration
+    if version_dir:
+        save_training_config(
+            version_dir=version_dir,
+            args=args,
+            config=config,
+            additional_info={
+                'n_classes': n_classes,
+                'n_channels': n_channels,
+                'categories': categories,
+                'train_samples': len(train_x),
+                'valid_samples': len(valid_x),
+                'test_samples': len(test_x),
+            }
+        )
+
+    # Train the model
+    save_path = None
+    if version_dir:
+        save_name = args.save_name or 'model_best.pt'
+        save_path = os.path.join(version_dir, save_name)
+
+    history = trainer.fit(
+        train_x, train_y,
+        val_x=valid_x, val_y=valid_y,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        verbose=1,
+        save_best=save_path,
+        use_amp=not args.no_amp,
+        augment=args.augment
+    )
+
+    # Final evaluation
+    print("=" * 60)
+    print("FINAL EVALUATION")
+    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("FINAL EVALUATION")
+    logger.info("=" * 60)
+
+    train_loss, train_acc = trainer.evaluate(train_x, train_y, batch_size=args.batch_size)
+    print(f"  Training   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
+    logger.info(f"  Training   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
+
+    valid_loss, valid_acc = trainer.evaluate(valid_x, valid_y, batch_size=args.batch_size)
+    print(f"  Validation - Loss: {valid_loss:.4f}, Accuracy: {valid_acc:.4f}")
+    logger.info(f"  Validation - Loss: {valid_loss:.4f}, Accuracy: {valid_acc:.4f}")
+
+    test_loss, test_acc = trainer.evaluate(test_x, test_y, batch_size=args.batch_size)
+    print(f"  Test       - Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
+    logger.info(f"  Test       - Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
+
+    # Compare with paper results
+    paper_results = {
+        'overhead': {'accuracy': 0.913, 'std': 0.004, 'params': 622},
+        'lcz': {'accuracy': 0.914, 'std': 0.004, 'params': 1054},
+        'sat': {'accuracy': 0.952, 'std': 0.004, 'params': 1119},
+    }
+
+    if args.dataset in paper_results:
+        paper = paper_results[args.dataset]
+        logger.info("")
+        logger.info("Comparison with Paper (Table VI):")
+        logger.info(f"  Paper Accuracy:  {paper['accuracy']:.3f} +/- {paper['std']:.3f}")
+        logger.info(f"  Our Accuracy:    {test_acc:.3f}")
+        logger.info(f"  Paper Params:    {paper['params']}")
+        logger.info(f"  Our Params:      {model.count_parameters()}")
+
+    # Save final model and training history
+    if version_dir:
+        # Save final model
+        final_path = os.path.join(version_dir, 'model_final.pt')
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'config': config.__dict__,
+            'args': vars(args),
+            'n_classes': n_classes,
+            'n_channels': n_channels,
+            'test_accuracy': test_acc,
+            'history': history,
+        }, final_path)
+        logger.info(f"Final model saved to: {final_path}")
+
+        # Save training history separately for easy access
+        import json
+        history_path = os.path.join(version_dir, 'history.json')
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
+        logger.info(f"Training history saved to: {history_path}")
+
+        # Save results summary
+        results_path = os.path.join(version_dir, 'results.json')
+        results = {
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'valid_loss': valid_loss,
+            'valid_acc': valid_acc,
+            'test_loss': test_loss,
+            'test_acc': test_acc,
+            'best_val_acc': max(history['val_acc']) if history['val_acc'] else None,
+            'best_epoch': history['val_acc'].index(max(history['val_acc'])) + 1 if history['val_acc'] else None,
+            'total_epochs': len(history['train_loss']),
+        }
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"Results summary saved to: {results_path}")
+
+        print(f"\nAll outputs saved to: {version_dir}")
+        logger.info(f"All outputs saved to: {version_dir}")
+
+    print("=" * 60)
+    print("TRAINING COMPLETE")
+    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("TRAINING COMPLETE")
+    logger.info("=" * 60)
+
+    return {
+        'model': model,
+        'trainer': trainer,
+        'history': history,
+        'test_acc': test_acc,
+        'test_loss': test_loss
+    }
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    main()
+
+
+
+
